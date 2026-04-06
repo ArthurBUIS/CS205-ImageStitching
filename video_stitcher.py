@@ -36,6 +36,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# Import optimization class
+sys.path.insert(0, str(Path(__file__).parent))
+from optimization import ConvexPolygonMaxRectangle
+
 
 # ---------------------------------------------------------------------------
 # 1.  HOMOGRAPHY CALIBRATION
@@ -307,182 +311,186 @@ def line_segment_intersection_with_horizontal(p1, p2, y):
     return np.array([x, y])
 
 
-def is_rectangle(hull_points, tolerance=1.0):
+def find_crop_rectangle_handcrafted(H: np.ndarray, left_shape, right_shape,
+                                     canvas_w: int, canvas_h: int, tx: int, ty: int):
     """
-    Check if hull_points form a proper rectangle (all 4 sides are horizontal or vertical).
-    tolerance: in pixels (default 1.0 pixel to account for floating-point rounding)
-    """
-    if len(hull_points) != 4:
-        print(f"[is_rectangle] Not 4 points: {len(hull_points)} points")
-        return False
-
-    # Check each side
-    for i in range(4):
-        p1 = hull_points[i]
-        p2 = hull_points[(i + 1) % 4]
-
-        is_horizontal = abs(p1[1] - p2[1]) < tolerance
-        is_vertical = abs(p1[0] - p2[0]) < tolerance
-
-        if not (is_horizontal or is_vertical):
-            print(f"[is_rectangle] Side {i} is not straight: p1={p1}, p2={p2}")
-            print(f"              dx={abs(p1[0] - p2[0]):.6f}, dy={abs(p1[1] - p2[1]):.6f}")
-            return False
-
-    print(f"[is_rectangle] ✓ Is a valid rectangle!")
-    return True
-
-
-def find_crop_rectangle_from_corners(H: np.ndarray, left_shape, right_shape,
-                                      canvas_w: int, canvas_h: int, tx: int, ty: int):
-    """
-    Find the largest rectangle by iteratively trimming the convex hull of corner points.
+    Simple handcrafted approach to find crop rectangle.
 
     Algorithm:
-    1. Get all image corners transformed to canvas coordinates
-    2. Compute convex hull
-    3. Find a straight edge (horizontal or vertical)
-    4. Draw perpendicular lines through its endpoints
-    5. Trim other hull points by intersecting with perpendicular lines
-    6. Recalculate hull
-    7. Repeat until all 4 sides are straight (forming a rectangle) or no more straight edges
+    1. Get left image corners on canvas (defines y_min, y_max)
+    2. Draw horizontal lines at y_min and y_max
+    3. Find where these lines intersect the convex hull edges
+    4. Find the intersection with smallest x, constrained to x > x_left (right edge of left image)
+    5. Use that x as x_max, crop region is (0, y_min, x_max, y_max - y_min)
 
     Returns: (x, y, width, height) in canvas coordinates
     """
     h1, w1 = left_shape[:2]
     h2, w2 = right_shape[:2]
 
-    # Get left image corners in canvas coordinates (just translated)
+    # Get left image corners in canvas coordinates
     left_corners = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]])
     left_canvas = left_corners + np.array([tx, ty])
 
-    # Get right image corners transformed by homography, then translated
+    # Get y bounds from left image
+    y_min = int(left_canvas[:, 1].min())
+    y_max = int(left_canvas[:, 1].max())
+
+    # Get x bound: right edge of left image on canvas
+    x_left = int(left_canvas[:, 0].max())
+
+    # Get right image corners transformed
     right_corners = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
     right_warped = cv2.perspectiveTransform(right_corners, H).reshape(-1, 2)
     right_canvas = right_warped + np.array([tx, ty])
 
-    # Combine all corners
+    # Compute convex hull of all corners
     all_corners = np.vstack([left_canvas, right_canvas]).astype(np.float32)
-
-    # Start with convex hull
     hull = cv2.convexHull(all_corners)
     hull_points = hull.reshape(-1, 2).astype(np.float64)
 
-    processed_sides = set()  # Track processed sides to avoid infinite loops
+    # Find intersections of horizontal lines (y_min and y_max) with hull edges
+    intersections = []
 
-    # Iteratively trim until rectangle
-    iteration = 0
-    while not is_rectangle(hull_points):
-        iteration += 1
-        print(f"\n[Iteration {iteration}] Hull points ({len(hull_points)} pts):")
-        for idx, pt in enumerate(hull_points):
-            print(f"  [{idx}] ({pt[0]:.2f}, {pt[1]:.2f})")
-
-        found_straight = False
-
-        # Look for a straight side
+    for y_line in [y_min, y_max]:
         for i in range(len(hull_points)):
             p1 = hull_points[i]
             p2 = hull_points[(i + 1) % len(hull_points)]
 
-            # Skip if already processed
-            if i in processed_sides:
-                continue
+            # Find intersection with horizontal line at y_line
+            intersection = line_segment_intersection_with_horizontal(p1, p2, y_line)
+            if intersection is not None:
+                intersections.append(intersection)
 
-            # Check if edge is straight (horizontal or vertical) - use 1 pixel tolerance
-            is_horizontal = abs(p1[1] - p2[1]) < 1.0
-            is_vertical = abs(p1[0] - p2[0]) < 1.0
+    if len(intersections) == 0:
+        # Fallback: use canvas dimensions
+        return 0, y_min, canvas_w, y_max - y_min
 
-            if not (is_horizontal or is_vertical):
-                continue
+    # Find the intersection with smallest x, constrained to x > x_left
+    intersections = np.array(intersections)
+    valid_intersections = intersections[intersections[:, 0] > x_left]
 
-            # Found a straight side!
-            processed_sides.add(i)
-            found_straight = True
-            print(f"  [Found straight edge {i}: {'horizontal' if is_horizontal else 'vertical'}]")
+    if len(valid_intersections) == 0:
+        # No valid intersections beyond left image, fallback to right edge of canvas
+        return 0, y_min, canvas_w, y_max - y_min
 
-            # Determine perpendicular lines
-            if is_horizontal:
-                # Edge is horizontal, perpendicular lines are vertical (at x = p1[0], p2[0])
-                perp_lines = [p1[0], p2[0]]
-                perp_type = 'vertical'
-            else:
-                # Edge is vertical, perpendicular lines are horizontal (at y = p1[1], p2[1])
-                perp_lines = [p1[1], p2[1]]
-                perp_type = 'horizontal'
+    x_max = int(valid_intersections[:, 0].min())  # Smallest valid x
 
-            # Trim other points
-            new_points = [p1, p2]
+    # Ensure x_max is within bounds
+    x_max = max(x_left + 1, min(x_max, canvas_w))
 
-            for j in range(len(hull_points)):
-                if j == i or j == (i + 1) % len(hull_points):
-                    continue
+    return 0, y_min, x_max, y_max - y_min
 
-                p = hull_points[j]
-                p_prev = hull_points[(j - 1) % len(hull_points)]
-                p_next = hull_points[(j + 1) % len(hull_points)]
 
-                intersection = None
+def find_crop_rectangle_optimization(H: np.ndarray, left_shape, right_shape,
+                                      canvas_w: int, canvas_h: int, tx: int, ty: int):
+    """
+    Optimization-based approach: find the largest axis-aligned rectangle that fits
+    entirely within the convex hull of the image corners.
 
-                # Try first neighbor edge (p_prev -> p)
-                if perp_type == 'vertical':
-                    intersection = line_segment_intersection_with_vertical(p_prev, p, perp_lines[0])
-                    if intersection is None:
-                        intersection = line_segment_intersection_with_vertical(p_prev, p, perp_lines[1])
-                else:
-                    intersection = line_segment_intersection_with_horizontal(p_prev, p, perp_lines[0])
-                    if intersection is None:
-                        intersection = line_segment_intersection_with_horizontal(p_prev, p, perp_lines[1])
+    Uses ConvexPolygonMaxRectangle to search over all possible x-ranges and find
+    the maximum area rectangle.
 
-                # If first edge didn't work, try second neighbor edge (p -> p_next)
-                if intersection is None:
-                    if perp_type == 'vertical':
-                        intersection = line_segment_intersection_with_vertical(p, p_next, perp_lines[0])
-                        if intersection is None:
-                            intersection = line_segment_intersection_with_vertical(p, p_next, perp_lines[1])
-                    else:
-                        intersection = line_segment_intersection_with_horizontal(p, p_next, perp_lines[0])
-                        if intersection is None:
-                            intersection = line_segment_intersection_with_horizontal(p, p_next, perp_lines[1])
+    Returns: (x, y, width, height) in canvas coordinates
+    """
+    h1, w1 = left_shape[:2]
+    h2, w2 = right_shape[:2]
 
-                # Add point if intersection found, otherwise remove it
-                if intersection is not None:
-                    new_points.append(intersection)
+    # Get left image corners in canvas coordinates
+    left_corners = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]])
+    left_canvas = left_corners + np.array([tx, ty])
 
-            # Recalculate convex hull with trimmed points
-            if len(new_points) >= 3:
-                hull = cv2.convexHull(np.array(new_points, dtype=np.float32))
-                hull_points = hull.reshape(-1, 2).astype(np.float64)
-                print(f"  [Trimmed to {len(hull_points)} points]")
+    # Get right image corners transformed
+    right_corners = np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)
+    right_warped = cv2.perspectiveTransform(right_corners, H).reshape(-1, 2)
+    right_canvas = right_warped + np.array([tx, ty])
 
-            # Break and restart with new hull
-            break
+    # Compute convex hull of all corners
+    all_corners = np.vstack([left_canvas, right_canvas]).astype(np.float32)
+    hull = cv2.convexHull(all_corners)
+    hull_points = hull.reshape(-1, 2)
 
-        if not found_straight:
-            # No more straight sides found
-            print(f"[No more straight sides found - stopping]")
-            break
+    # Convert to list of tuples for the optimizer
+    vertices = [tuple(pt) for pt in hull_points]
 
-    # Get bounding box of final rectangle
-    print(f"\n[Final] Hull points ({len(hull_points)} pts):")
-    for idx, pt in enumerate(hull_points):
-        print(f"  [{idx}] ({pt[0]:.2f}, {pt[1]:.2f})")
+    # Run optimization
+    optimizer = ConvexPolygonMaxRectangle(vertices)
 
-    x_min = int(np.floor(hull_points[:, 0].min()))
-    y_min = int(np.floor(hull_points[:, 1].min()))
-    x_max = int(np.ceil(hull_points[:, 0].max()))
-    y_max = int(np.ceil(hull_points[:, 1].max()))
+    # Extended algorithm to track coordinates
+    xs = optimizer.xs
+    upper = optimizer.upper
+    lower = optimizer.lower
+    upper_x = [p[0] for p in upper]
+    lower_x = [p[0] for p in lower]
 
-    print(f"[Final] x_min={x_min}, x_max={x_max}, y_min={y_min}, y_max={y_max}")
+    best_area = 0.0
+    best_rect = (0, 0, 1, 1)
 
-    x = max(0, x_min)
-    y = max(0, y_min)
-    w = min(canvas_w - x, x_max - x_min)
-    h = min(canvas_h - y, y_max - y_min)
+    for i in range(len(xs)):
+        x1 = xs[i]
 
-    print(f"[Final] Computed: x={x}, y={y}, w={w}, h={h}")
+        top_min = float('inf')
+        bot_max = -float('inf')
+        y_top_at_x1 = None
+        y_bot_at_x1 = None
 
-    return x, y, w, h
+        # Reset pointers for chains
+        up_ptr = 0
+        low_ptr = 0
+
+        # Advance pointers to x1
+        while up_ptr + 1 < len(upper) and upper_x[up_ptr + 1] < x1:
+            up_ptr += 1
+        while low_ptr + 1 < len(lower) and lower_x[low_ptr + 1] < x1:
+            low_ptr += 1
+
+        for j in range(i + 1, len(xs)):
+            x2 = xs[j]
+
+            # Evaluate upper chain at x2
+            while up_ptr + 1 < len(upper) and upper_x[up_ptr + 1] < x2:
+                up_ptr += 1
+            y_top_x2 = optimizer._interp(upper[up_ptr], upper[min(up_ptr + 1, len(upper) - 1)], x2)
+
+            # Evaluate lower chain at x2
+            while low_ptr + 1 < len(lower) and lower_x[low_ptr + 1] < x2:
+                low_ptr += 1
+            y_bot_x2 = optimizer._interp(lower[low_ptr], lower[min(low_ptr + 1, len(lower) - 1)], x2)
+
+            # Update constraints
+            top_min = min(top_min, y_top_x2)
+            bot_max = max(bot_max, y_bot_x2)
+
+            height = top_min - bot_max
+            if height > 0:
+                area = height * (x2 - x1)
+                if area > best_area:
+                    best_area = area
+                    best_rect = (int(x1), int(bot_max), int(x2 - x1), int(height))
+
+    if best_area == 0:
+        # Fallback: use handcrafted approach
+        return find_crop_rectangle_handcrafted(H, left_shape, right_shape, canvas_w, canvas_h, tx, ty)
+
+    return best_rect
+
+
+def find_crop_rectangle_from_corners(H: np.ndarray, left_shape, right_shape,
+                                      canvas_w: int, canvas_h: int, tx: int, ty: int,
+                                      method: str = "handcrafted"):
+    """
+    Find crop rectangle using selected method.
+
+    method: "handcrafted" (simple) or "optimization" (placeholder for future)
+    """
+    if method == "handcrafted":
+        return find_crop_rectangle_handcrafted(H, left_shape, right_shape, canvas_w, canvas_h, tx, ty)
+    elif method == "optimization":
+        return find_crop_rectangle_optimization(H, left_shape, right_shape, canvas_w, canvas_h, tx, ty)
+    else:
+        raise ValueError(f"Unknown auto-crop method: {method}")
+
+
 
 
 def compute_blend_mask(left_warped: np.ndarray, right_warped: np.ndarray,
@@ -536,7 +544,8 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
                   blend_levels: int = 6,
                   blend_width: int = 80,
                   sigma_max: float = 4.0,
-                  auto_crop: bool = False):
+                  auto_crop: bool = False,
+                  auto_crop_method: str = "handcrafted"):
 
     cap_left  = cv2.VideoCapture(left_path)
     cap_right = cv2.VideoCapture(right_path)
@@ -584,7 +593,8 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
     if auto_crop:
         print("[Auto-crop] Computing crop rectangle from image corners...")
         crop_x, crop_y, crop_w, crop_h = find_crop_rectangle_from_corners(
-            H, sample_left.shape, sample_right.shape, canvas_w, canvas_h, tx, ty)
+            H, sample_left.shape, sample_right.shape, canvas_w, canvas_h, tx, ty,
+            method=auto_crop_method)
         print(f"[Auto-crop] Crop region: x={crop_x}, y={crop_y}, "
               f"size={crop_w}×{crop_h} (original canvas: {canvas_w}×{canvas_h})")
 
@@ -668,6 +678,9 @@ def parse_args():
     p.add_argument("--auto-crop",    action="store_true",
                    help="Automatically crop to largest rectangle using homography corners "
                         "(removes black/empty zones at image edges)")
+    p.add_argument("--auto-crop-method", type=str, default="handcrafted",
+                   choices=["handcrafted", "optimization"],
+                   help="Auto-crop method: 'handcrafted' (simple, default) or 'optimization' (future)")
     return p.parse_args()
 
 
@@ -684,4 +697,5 @@ if __name__ == "__main__":
         blend_width      = args.blend_width,
         sigma_max        = args.sigma_max,
         auto_crop        = args.auto_crop,
+        auto_crop_method = args.auto_crop_method,
     )
