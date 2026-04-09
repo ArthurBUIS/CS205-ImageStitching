@@ -601,6 +601,40 @@ def compute_blend_mask(left_warped: np.ndarray, right_warped: np.ndarray,
     return mask
 
 
+def refine_blend_mask_for_motion(mask: np.ndarray, left_warped: np.ndarray, right_warped: np.ndarray,
+                                  motion_threshold: float = 0.15):
+    """
+    Refine the blend mask to reduce ghosting from moving objects.
+
+    Where the two warped views have large differences in the overlap zone
+    (indicating motion or misalignment), harden the mask transition to avoid
+    averaging, which would create ghosts.
+    """
+    h, w = left_warped.shape[:2]
+
+    left_valid = (left_warped.sum(axis=2) > 0).astype(np.float32)
+    right_valid = (right_warped.sum(axis=2) > 0).astype(np.float32)
+    overlap = (left_valid * right_valid)
+
+    # Compute per-pixel difference in the overlap zone (normalized to [0,1])
+    left_gray = cv2.cvtColor(left_warped, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    right_gray = cv2.cvtColor(right_warped, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    diff = np.abs(left_gray - right_gray) * overlap
+
+    # Threshold: high difference indicates motion
+    motion_mask = (diff > motion_threshold).astype(np.float32)
+
+    # In high-motion regions, harden the mask: push it toward 0 or 1 based on current value
+    refined_mask = mask.copy()
+    refined_mask[motion_mask > 0] = np.where(
+        refined_mask[motion_mask > 0] > 0.5,
+        np.minimum(refined_mask[motion_mask > 0] + 0.2, 1.0),  # Favor left
+        np.maximum(refined_mask[motion_mask > 0] - 0.2, 0.0),  # Favor right
+    )
+
+    return refined_mask
+
+
 # ---------------------------------------------------------------------------
 # 4.  MAIN PIPELINE
 # ---------------------------------------------------------------------------
@@ -742,8 +776,11 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
             right_map_x, right_map_y,
         )
 
+        # Refine mask to reduce ghosting from moving objects
+        dynamic_blend_mask = refine_blend_mask_for_motion(blend_mask, wl, wr)
+
         # Multi-band blend
-        stitched_full = multiband_blend(wl, wr, blend_mask, levels=blend_levels)
+        stitched_full = multiband_blend(wl, wr, dynamic_blend_mask, levels=blend_levels)
 
         # Crop if auto_crop is enabled
         if auto_crop:
