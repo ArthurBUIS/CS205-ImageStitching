@@ -45,35 +45,56 @@ from optimization import ConvexPolygonMaxRectangle
 # 1.  HOMOGRAPHY CALIBRATION
 # ---------------------------------------------------------------------------
 
+_XFEAT_MODEL = None
+_XFEAT_DEVICE = None
+
+
+def _load_xfeat_model(device: str = "cpu"):
+    """Return a lazily created XFeat model from Torch Hub."""
+    global _XFEAT_MODEL, _XFEAT_DEVICE
+
+    if _XFEAT_MODEL is not None and _XFEAT_DEVICE == device:
+        return _XFEAT_MODEL
+
+    import torch
+
+    model = torch.hub.load(
+        "verlab/accelerated_features",
+        "XFeat",
+        pretrained=True,
+        top_k=5000,
+    ).to(torch.device(device)).eval()
+    _XFEAT_MODEL = model
+    _XFEAT_DEVICE = device
+    return model
+
 def detect_and_match(img1_gray: np.ndarray, img2_gray: np.ndarray,
                      max_features: int = 5000,
-                     ratio_thresh: float = 0.75):
+                     ratio_thresh: float = 0.75,
+                     device: str = "cpu"):
     """
-    Detect SIFT keypoints and match them with Lowe's ratio test.
+    Detect XFeat keypoints and match them directly.
     Returns matched keypoints (pts1, pts2) as float32 arrays.
     """
-    sift = cv2.SIFT_create(nfeatures=max_features)
-    kp1, des1 = sift.detectAndCompute(img1_gray, None)
-    kp2, des2 = sift.detectAndCompute(img2_gray, None)
+    import torch
 
-    if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+    def to_tensor(img):
+        rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+        return tensor.to(torch.device(device))
+
+    model = _load_xfeat_model(device=device)
+
+    with torch.no_grad():
+        out1 = model.detectAndCompute(to_tensor(img1_gray), top_k=max_features)[0]
+        out2 = model.detectAndCompute(to_tensor(img2_gray), top_k=max_features)[0]
+        idxs0, idxs1 = model.match(out1["descriptors"], out2["descriptors"], min_cossim=-1)
+
+    if idxs0 is None or idxs1 is None or len(idxs0) < 4:
         return None, None
 
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
-    raw_matches = matcher.knnMatch(des1, des2, k=2)
-
-    good = []
-    for pair in raw_matches:
-        if len(pair) == 2:
-            m, n = pair
-            if m.distance < ratio_thresh * n.distance:
-                good.append(m)
-
-    if len(good) < 4:
-        return None, None
-
-    pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
-    pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
+    pts1 = out1["keypoints"][idxs0].cpu().numpy().astype(np.float32)
+    pts2 = out2["keypoints"][idxs1].cpu().numpy().astype(np.float32)
     return pts1, pts2
 
 
@@ -83,14 +104,14 @@ def compute_homography_from_frames(cap_left: cv2.VideoCapture,
                                    sigma_max: float = 4.0):
     """
     Read the first n_frames from both videos, compute a homography per frame
-    using SIFT + MAGSAC++, then return the median homography (element-wise).
+    using XFeat + MAGSAC++, then return the median homography (element-wise).
 
     MAGSAC++ (cv2.USAC_MAGSAC) differences vs RANSAC
     --------------------------------------------------
     - Instead of a hard inlier/outlier threshold, it marginalises the fitting
       score over a distribution of noise scales up to `sigma_max` (pixels).
-    - This makes it significantly more accurate when matches have heterogeneous
-      noise (e.g. SIFT matches at different image scales) and more robust in
+        - This makes it significantly more accurate when matches have heterogeneous
+            noise and more robust in
       low-overlap or low-inlier-ratio situations — both common during video
       stitching calibration.
     - `sigma_max` is an upper bound on the expected noise standard deviation,
