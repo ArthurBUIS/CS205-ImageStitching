@@ -29,8 +29,10 @@ Usage
 """
 
 import argparse
+import queue
 import sys
 import time
+import threading
 from pathlib import Path
 
 import cv2
@@ -220,6 +222,51 @@ def warp_images(left: np.ndarray, right: np.ndarray,
     H_translated = T @ H
     warped_right = cv2.warpPerspective(right, H_translated, (canvas_w, canvas_h))
 
+    return warped_left, warped_right
+
+
+def prepare_remap_grids(H: np.ndarray, canvas_w: int, canvas_h: int, tx: int, ty: int):
+    """Precompute dense source-coordinate maps for cv2.remap()."""
+    grid_x, grid_y = np.meshgrid(
+        np.arange(canvas_w, dtype=np.float32),
+        np.arange(canvas_h, dtype=np.float32),
+    )
+
+    # Left image is a pure translation onto the canvas.
+    left_map_x = grid_x - float(tx)
+    left_map_y = grid_y - float(ty)
+
+    # Right image uses the inverse of the translated homography.
+    T = np.array([[1, 0, tx],
+                  [0, 1, ty],
+                  [0, 0,  1]], dtype=np.float64)
+    H_translated = T @ H
+    H_inv = np.linalg.inv(H_translated)
+
+    canvas_points = np.stack([grid_x.ravel(), grid_y.ravel()], axis=-1).reshape(-1, 1, 2)
+    right_src = cv2.perspectiveTransform(canvas_points, H_inv).reshape(canvas_h, canvas_w, 2)
+    right_map_x = right_src[:, :, 0].astype(np.float32)
+    right_map_y = right_src[:, :, 1].astype(np.float32)
+
+    return left_map_x, left_map_y, right_map_x, right_map_y
+
+
+def remap_images(left: np.ndarray, right: np.ndarray,
+                 left_map_x: np.ndarray, left_map_y: np.ndarray,
+                 right_map_x: np.ndarray, right_map_y: np.ndarray):
+    """Warp both frames using precomputed remap grids."""
+    warped_left = cv2.remap(
+        left, left_map_x, left_map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    warped_right = cv2.remap(
+        right, right_map_x, right_map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
     return warped_left, warped_right
 
 
@@ -568,6 +615,8 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
                   auto_crop: bool = False,
                   auto_crop_method: str = "handcrafted"):
 
+    frame_sentinel = object()
+
     cap_left  = cv2.VideoCapture(left_path)
     cap_right = cv2.VideoCapture(right_path)
 
@@ -609,6 +658,10 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
     canvas_w, canvas_h, tx, ty = compute_canvas_size(H, sample_left.shape, sample_right.shape)
     print(f"[Canvas] {canvas_w}×{canvas_h}  offset=({tx},{ty})")
 
+    # ---- Warp grids (computed ONCE) ---------------------------------------
+    left_map_x, left_map_y, right_map_x, right_map_y = prepare_remap_grids(
+        H, canvas_w, canvas_h, tx, ty)
+
     # ---- Auto-crop: compute rectangle from homography corners ----------------
     crop_x, crop_y, crop_w, crop_h = 0, 0, canvas_w, canvas_h  # defaults (no crop)
     if auto_crop:
@@ -629,9 +682,47 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
 
     # ---- Blend mask (computed ONCE on first frame) ------------------------
     print("[Blend mask] Computing from first frame …")
-    left0_w, right0_w = warp_images(sample_left, sample_right, H, canvas_w, canvas_h, tx, ty)
+    left0_w, right0_w = remap_images(
+        sample_left, sample_right,
+        left_map_x, left_map_y,
+        right_map_x, right_map_y,
+    )
     blend_mask = compute_blend_mask(left0_w, right0_w, blend_width=blend_width)
     print("[Blend mask] Done.")
+
+    # Reset to start before the threaded processing pass.
+    cap_left.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    cap_right.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    # ---- Async I/O queues --------------------------------------------------
+    read_queue: queue.Queue = queue.Queue(maxsize=8)
+    write_queue: queue.Queue = queue.Queue(maxsize=8)
+
+    def reader_worker():
+        try:
+            while True:
+                ok1, frame_left = cap_left.read()
+                ok2, frame_right = cap_right.read()
+                if not ok1 or not ok2:
+                    break
+                read_queue.put((frame_left, frame_right))
+        finally:
+            read_queue.put(frame_sentinel)
+
+    def writer_worker():
+        try:
+            while True:
+                item = write_queue.get()
+                if item is frame_sentinel:
+                    break
+                writer.write(item)
+        finally:
+            pass
+
+    reader_thread = threading.Thread(target=reader_worker, daemon=True)
+    writer_thread = threading.Thread(target=writer_worker, daemon=True)
+    reader_thread.start()
+    writer_thread.start()
 
     # ---- Frame loop --------------------------------------------------------
     print(f"[Stitching] Processing {total} frames …")
@@ -639,28 +730,38 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
     frame_idx = 0
 
     while True:
-        ok1, frame_left  = cap_left.read()
-        ok2, frame_right = cap_right.read()
-        if not ok1 or not ok2:
+        item = read_queue.get()
+        if item is frame_sentinel:
             break
+        frame_left, frame_right = item
 
-        # Warp both frames onto the shared canvas
-        wl, wr = warp_images(frame_left, frame_right, H, canvas_w, canvas_h, tx, ty)
+        # Warp both frames onto the shared canvas using precomputed remap grids.
+        wl, wr = remap_images(
+            frame_left, frame_right,
+            left_map_x, left_map_y,
+            right_map_x, right_map_y,
+        )
 
         # Multi-band blend
-        stitched = multiband_blend(wl, wr, blend_mask, levels=blend_levels)
+        stitched_full = multiband_blend(wl, wr, blend_mask, levels=blend_levels)
 
         # Crop if auto_crop is enabled
         if auto_crop:
-            stitched = stitched[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+            stitched = stitched_full[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+        else:
+            stitched = stitched_full
 
-        writer.write(stitched)
+        write_queue.put(stitched)
         frame_idx += 1
 
         if frame_idx % 30 == 0:
             elapsed = time.time() - t0
             fps_actual = frame_idx / elapsed
             print(f"  {frame_idx}/{total}  ({fps_actual:.1f} fps)", end="\r")
+
+    write_queue.put(frame_sentinel)
+    writer_thread.join()
+    reader_thread.join()
 
     elapsed = time.time() - t0
     print(f"\n[Done] {frame_idx} frames in {elapsed:.1f}s  "
