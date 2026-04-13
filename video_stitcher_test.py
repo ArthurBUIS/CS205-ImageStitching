@@ -561,36 +561,65 @@ def find_crop_rectangle_from_corners(H: np.ndarray, left_shape, right_shape,
 
 
 
-def compute_blend_mask(left_warped: np.ndarray, right_warped: np.ndarray,
-                       blend_width: int = 80):
+def compute_zone_boundaries(left_warped: np.ndarray,
+                             right_warped: np.ndarray) -> tuple[int, int]:
     """
-    Fallback: simple gradient blend mask (used when graph-cut is disabled).
+    Compute the two seam-line x-positions that define the three zones.
 
-    Strategy: find the horizontal seam (vertical line where both images overlap)
-    and create a smooth gradient of width `blend_width` pixels around it.
-    Pixels only in the left  → mask = 1
-    Pixels only in the right → mask = 0
-    Overlap region           → smooth gradient 1→0 around the seam
+    Zone 1  [0,          seam_left)  : left image only
+    Zone 2  [seam_left,  seam_right) : overlap — both images present
+    Zone 3  [seam_right, canvas_w)   : right image only
+
+    seam_left  = first canvas column where the right image appears
+                 (left frontier of the overlap = boundary between zone 1/2)
+    seam_right = last  canvas column where the left  image appears + 1
+                 (right frontier of the overlap = boundary between zone 2/3)
+
+    Returns (seam_left, seam_right) as integer column indices.
+    """
+    # Per-row first/last valid column for each image
+    left_valid  = left_warped.sum(axis=2)  > 0   # (H, W) bool
+    right_valid = right_warped.sum(axis=2) > 0
+
+    # Collapse to per-column presence
+    left_cols  = np.where(left_valid.any(axis=0))[0]
+    right_cols = np.where(right_valid.any(axis=0))[0]
+
+    seam_left  = int(right_cols[0])               # right image starts here
+    seam_right = int(left_cols[-1]) + 1           # left image ends here (+1 for slice)
+    return seam_left, seam_right
+
+
+def build_blend_mask(seam_x: int,
+                     left_warped: np.ndarray,
+                     right_warped: np.ndarray,
+                     blend_width: int = 80) -> np.ndarray:
+    """
+    Build a float32 blend mask (H, W) with values in [0, 1].
+    1.0 = take from left image, 0.0 = take from right image.
+
+    The seam is placed at `seam_x`.  A gradient ramp of `blend_width`
+    pixels is applied symmetrically around the seam so the cut is smooth.
+    Outside the overlap zone the mask is clamped hard to 1 or 0.
     """
     h, w = left_warped.shape[:2]
-
     left_valid  = (left_warped.sum(axis=2)  > 0).astype(np.float32)
     right_valid = (right_warped.sum(axis=2) > 0).astype(np.float32)
-    overlap     = (left_valid * right_valid)
 
-    mask = left_valid.copy()
+    mask = np.zeros((h, w), dtype=np.float32)
 
-    for row in range(h):
-        cols = np.where(overlap[row] > 0)[0]
-        if len(cols) == 0:
-            continue
-        seam_x = int(cols.mean())
-        x0 = max(0, seam_x - blend_width // 2)
-        x1 = min(w, seam_x + blend_width // 2)
-        ramp = np.linspace(1.0, 0.0, x1 - x0)
-        mask[row, x0:x1] = ramp
-        mask[row, x1:]   = 0.0
+    half = blend_width // 2
+    x0 = max(0,     seam_x - half)
+    x1 = min(w - 1, seam_x + half)
+    n  = x1 - x0
 
+    mask[:, :x0]    = 1.0
+    if n > 0:
+        ramp = np.linspace(1.0, 0.0, n, dtype=np.float32)
+        mask[:, x0:x1] = ramp[np.newaxis, :]   # broadcast over rows
+    # mask[:, x1:] stays 0.0
+
+    # Hard constraints outside the overlap zone
     mask[right_valid == 0] = 1.0
     mask[left_valid  == 0] = 0.0
 
@@ -598,275 +627,88 @@ def compute_blend_mask(left_warped: np.ndarray, right_warped: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# 3b. MOTION-AWARE SEAM FUSION  (Step B from the paper)
-# ---------------------------------------------------------------------------
-#
-# Reference: Section 3.3 of
-#   "Real-Time Panoramic Surveillance Video Stitching Method for
-#    Complex Industrial Environments", Zhu et al., Sensors 2026.
-#
-# Implementation notes
-# --------------------
-# The paper formulates seam finding as a graph min-cut (max-flow).
-# For a two-camera panoramic stitch the overlap region is a roughly
-# vertical strip, so the optimal seam is a single connected path that
-# runs top-to-bottom through that strip.  Finding such a path is
-# equivalent to seam-carving (Avidan & Shamir, 2007) and can be solved
-# in O(H * W_overlap) time with a 1-D dynamic program — many orders of
-# magnitude faster than a dense 2-D max-flow on a megapixel image.
-#
-# The energy terms are identical to the paper (Eqs. 6-15):
-#   Es(p,q) = colour difference   Id(p)  (Eq. 10)
-#   Eg(p,q) = Sobel edge weight   W(p)   (Eqs. 12-14) with sigmoid
-#
-# The motion constraint (Eq. 16) is enforced by setting the energy to
-# +inf inside M_Omega so the DP seam is routed around moving objects.
-#
-# The two-frame workflow (Section 3.1 of the paper):
-#   First frame  : compute seam, cache it.
-#   Later frames : run background subtraction in the overlap zone;
-#                  if motion pixels touch the cached seam, recompute;
-#                  otherwise reuse the cache for free.
+# 3b.  MOTION DETECTION
 # ---------------------------------------------------------------------------
 
-def _compute_overlap_mask(left_warped: np.ndarray,
-                          right_warped: np.ndarray) -> np.ndarray:
+def update_background(bg_mean: np.ndarray,
+                       gray: np.ndarray,
+                       alpha: float = 0.05) -> np.ndarray:
+    """Exponential moving average background update. Returns new bg_mean."""
+    return bg_mean * (1.0 - alpha) + gray * alpha
+
+
+def detect_motion(gray: np.ndarray,
+                  bg_mean: np.ndarray,
+                  threshold: int = 25) -> np.ndarray:
     """
-    Return a boolean mask that is True wherever BOTH warped images have
-    valid (non-zero) pixels — the overlap region Omega.
+    Return a boolean mask (H, W) — True where motion is detected.
+    Uses absolute difference from the background model + morphological
+    cleanup to remove noise.
     """
-    left_valid  = left_warped.sum(axis=2)  > 0
-    right_valid = right_warped.sum(axis=2) > 0
-    return left_valid & right_valid
-
-
-def _compute_seam_energy(left_warped: np.ndarray,
-                         right_warped: np.ndarray,
-                         alpha: float = 1.0,
-                         beta:  float = 1.0) -> np.ndarray:
-    """
-    Per-pixel energy map E(p) = alpha*Es(p) + beta*Eg(p) over the full
-    canvas.  Low energy = good place for the seam to pass through.
-
-    Es(p) -- smoothness / colour-difference term  (Eq. 10)
-        Id(p) = ||I0(p) - I1(p)||^2   (squared L2 over BGR channels)
-
-    Eg(p) -- gradient / edge-saliency term  (Eqs. 12-15)
-        W(p) = sigmoid(Wx(p) + Wy(p))
-        Wx,Wy: squared Sobel responses of the inter-image difference.
-
-    Returns float32 array (H, W), normalised to [0, 1].
-    """
-    l = left_warped.astype(np.float32)
-    r = right_warped.astype(np.float32)
-    diff = l - r                                        # (H,W,3)
-
-    # --- Smoothness term: squared L2 colour difference ---
-    es = (diff * diff).sum(axis=2)                      # (H,W)
-
-    # --- Gradient term: Sobel on grayscale difference ---
-    diff_gray = diff.mean(axis=2).astype(np.float32)    # (H,W)
-    sx = cv2.Sobel(diff_gray, cv2.CV_32F, 1, 0, ksize=3)
-    sy = cv2.Sobel(diff_gray, cv2.CV_32F, 0, 1, ksize=3)
-    raw_grad = sx * sx + sy * sy                        # Wx + Wy
-
-    # Sigmoid normalisation (maps to (0,1), amplifies mid-range edges)
-    scale = float(raw_grad.max()) + 1e-6
-    eg = 1.0 / (1.0 + np.exp(-(raw_grad / scale - 0.5) * 6))
-
-    energy = alpha * es + beta * eg
-
-    # Normalise to [0,1] so alpha/beta stay meaningful across sequences
-    e_max = float(energy.max()) + 1e-6
-    return (energy / e_max).astype(np.float32)
-
-
-def _find_seam_dp(energy_strip: np.ndarray,
-                  motion_strip:  np.ndarray) -> np.ndarray:
-    """
-    Find the minimum-energy vertical seam through a 2-D energy strip
-    (H x W_strip) using dynamic programming.
-
-    motion_strip : boolean (H, W_strip).  True = infinite cost (forbidden).
-    Returns seam : int array (H,) of column indices within the strip.
-
-    This implements the same min-cost path as the graph min-cut in the
-    paper, but restricted to a path topology (top-to-bottom connectivity)
-    which is the correct model for a vertical panoramic seam and runs in
-    O(H * W_strip) time with fully vectorised numpy operations.
-    """
-    h, w = energy_strip.shape
-    INF = 1e9
-
-    # Apply motion constraint: forbidden pixels get infinite cost (Eq. 16)
-    cost = energy_strip.copy()
-    cost[motion_strip] = INF
-
-    # --- Forward DP pass --------------------------------------------------
-    dp = cost.copy()
-    for row in range(1, h):
-        prev = dp[row - 1]                          # (W,)
-        # Vectorised 3-neighbour minimum (col-1, col, col+1)
-        left_n  = np.empty_like(prev); left_n[:]  = INF
-        right_n = np.empty_like(prev); right_n[:] = INF
-        left_n[1:]  = prev[:-1]
-        right_n[:-1] = prev[1:]
-        dp[row] += np.minimum(prev, np.minimum(left_n, right_n))
-
-    # --- Traceback --------------------------------------------------------
-    seam = np.empty(h, dtype=np.int32)
-    seam[-1] = int(np.argmin(dp[-1]))
-    for row in range(h - 2, -1, -1):
-        c = seam[row + 1]
-        lo = max(0, c - 1)
-        hi = min(w - 1, c + 1)
-        seam[row] = lo + int(np.argmin(dp[row, lo:hi + 1]))
-
-    return seam
-
-
-def _seam_to_blend_mask(seam_cols:    np.ndarray,
-                        overlap_x0:   int,
-                        canvas_shape: tuple,
-                        left_valid:   np.ndarray,
-                        right_valid:  np.ndarray,
-                        feather_px:   int = 20) -> np.ndarray:
-    """
-    Convert a per-row seam column index to a float32 blend mask.
-
-    Everything strictly left  of the seam -> 1.0 (left image).
-    Everything strictly right of the seam -> 0.0 (right image).
-    A feathering ramp of width `feather_px` on each side of the seam
-    provides a smooth transition to avoid hard-edge artefacts.
-
-    seam_cols  : (H,) array, column indices within the overlap strip.
-    overlap_x0 : canvas column where the overlap strip starts.
-    """
-    h, w     = canvas_shape[:2]
-    mask     = np.zeros((h, w), dtype=np.float32)
-
-    # Absolute seam position in canvas coordinates
-    abs_seam = seam_cols + overlap_x0          # (H,)
-
-    for row in range(h):
-        x_seam = int(abs_seam[row])
-        half   = feather_px // 2
-
-        x0 = max(0,     x_seam - half)
-        x1 = min(w - 1, x_seam + half)
-        n  = x1 - x0
-
-        mask[row, :x0]     = 1.0
-        if n > 0:
-            mask[row, x0:x1] = np.linspace(1.0, 0.0, n, dtype=np.float32)
-        mask[row, x1:]     = 0.0
-
-    # Hard constraints outside the overlap zone
-    mask[~left_valid]              = 0.0
-    mask[~right_valid]             = 1.0
-    mask[left_valid & ~right_valid] = 1.0
-    mask[right_valid & ~left_valid] = 0.0
-
-    return mask
-
-
-def _detect_motion_region(left_warped:       np.ndarray,
-                           bg_model:          dict,
-                           overlap_mask:      np.ndarray,
-                           motion_threshold:  int = 30) -> np.ndarray:
-    """
-    Detect pixels in Omega that belong to a moving object: M_Omega.
-
-    Uses a per-pixel running-mean background model on the left warped
-    frame.  Morphological opening removes noise blobs; dilation creates
-    a safety margin so the seam stays away from object boundaries.
-
-    Returns motion_mask : boolean (H, W).
-    """
-    gray = cv2.cvtColor(left_warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-    if bg_model["mean"] is None:
-        bg_model["mean"] = gray.copy()
-        return np.zeros(gray.shape, dtype=bool)
-
-    diff = np.abs(gray - bg_model["mean"])
-    fg   = (diff > motion_threshold) & overlap_mask
+    diff = np.abs(gray.astype(np.float32) - bg_mean)
+    fg   = (diff > threshold).astype(np.uint8)
 
     kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    fg_clean = cv2.morphologyEx(fg.astype(np.uint8), cv2.MORPH_OPEN,   kernel)
-    fg_clean = cv2.morphologyEx(fg_clean,             cv2.MORPH_DILATE, kernel)
-
-    # Slow update only on static background pixels (alpha = 0.05)
-    static          = (fg_clean == 0).astype(np.float32)
-    bg_model["mean"] = (bg_model["mean"] * (1.0 - 0.05 * static)
-                        + gray            * (0.05 * static))
-
-    return fg_clean.astype(bool)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,   kernel)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_DILATE, kernel)
+    return fg.astype(bool)
 
 
-def compute_seam_mask_graphcut(
-        left_warped:    np.ndarray,
-        right_warped:   np.ndarray,
-        motion_mask:    np.ndarray | None = None,
-        alpha:          float = 1.0,
-        beta:           float = 1.0,
-        feather_px:     int   = 20,
-) -> np.ndarray:
+def choose_seam(motion_mask: np.ndarray,
+                prev_gray:   np.ndarray,
+                curr_gray:   np.ndarray,
+                seam_left:   int,
+                seam_right:  int,
+                canvas_w:    int) -> int:
     """
-    Compute the optimal seam via motion-aware DP and return a float32
-    blend mask (1.0 = left image, 0.0 = right image).
+    Given a motion mask and the two fixed seam positions, decide which
+    seam x-coordinate to use this frame.
 
-    This function is a drop-in replacement for the old max-flow
-    implementation and is called:
-      - Once on the first frame (motion_mask=None).
-      - Only when a motion pixel touches the cached seam on later frames.
+    Rules (from the paper / user spec):
+      - No motion detected          -> keep current seam unchanged (caller handles)
+      - Object in zone 1 (left-only)-> use seam_right  (push seam as far right as possible
+                                        so the object stays entirely in the left image)
+      - Object in zone 3 (right-only)-> use seam_left  (push seam as far left as possible
+                                        so the object stays entirely in the right image)
+      - Object in zone 2 (overlap)  -> determine direction of motion:
+            moving left  -> use seam_right
+            moving right -> use seam_left
 
-    Parameters
-    ----------
-    left_warped  : warped left  frame on canvas (BGR uint8)
-    right_warped : warped right frame on canvas (BGR uint8)
-    motion_mask  : optional bool (H,W) — pixels to avoid (M_Omega)
-    alpha        : smoothness weight (default 1, paper Section 3.3)
-    beta         : gradient weight  (default 1, paper Section 3.3)
-    feather_px   : blending ramp width in pixels on each side of seam
+    Returns the chosen seam x-position (seam_left or seam_right).
     """
-    h, w = left_warped.shape[:2]
+    if not motion_mask.any():
+        return None   # signal: no change needed
 
-    left_valid  = left_warped.sum(axis=2)  > 0
-    right_valid = right_warped.sum(axis=2) > 0
-    overlap     = left_valid & right_valid
+    # Find bounding-box centroid of the motion region
+    ys, xs = np.where(motion_mask)
+    cx = int(xs.mean())
 
-    if not overlap.any():
-        return left_valid.astype(np.float32)
+    in_zone1 = cx < seam_left
+    in_zone3 = cx >= seam_right
 
-    if motion_mask is None:
-        motion_mask = np.zeros((h, w), dtype=bool)
+    if in_zone1:
+        return seam_right
 
-    # --- Find the overlap column range ------------------------------------
-    overlap_cols = np.where(overlap.any(axis=0))[0]
-    if len(overlap_cols) == 0:
-        return left_valid.astype(np.float32)
-    x0_ov, x1_ov = int(overlap_cols[0]), int(overlap_cols[-1]) + 1
+    if in_zone3:
+        return seam_left
 
-    # --- Build energy and motion strips (overlap zone only) ---------------
-    energy_full = _compute_seam_energy(left_warped, right_warped, alpha, beta)
-    energy_strip  = energy_full[:, x0_ov:x1_ov]          # (H, W_ov)
-    motion_strip  = motion_mask[:, x0_ov:x1_ov]
+    # Zone 2 — determine horizontal motion direction by comparing
+    # the centroid of the motion blob between the previous and current frame.
+    # We re-detect on the previous frame to get its centroid.
+    diff_prev = np.abs(prev_gray.astype(np.float32) - curr_gray.astype(np.float32))
+    fg_prev   = (diff_prev > 10).astype(np.uint8)
+    kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_prev   = cv2.morphologyEx(fg_prev, cv2.MORPH_OPEN, kernel)
 
-    # Zero out energy outside the valid overlap rows (rows with no overlap)
-    row_has_overlap = overlap[:, x0_ov:x1_ov].any(axis=1)  # (H,)
-    energy_strip[~row_has_overlap] = 0.0
+    ys_p, xs_p = np.where(fg_prev.astype(bool))
+    if len(xs_p) > 0:
+        cx_prev = int(xs_p.mean())
+        moving_left = (cx - cx_prev) < 0
+    else:
+        # Fallback: can't determine direction, default to seam_right
+        moving_left = True
 
-    # --- Run DP seam finder -----------------------------------------------
-    seam_cols = _find_seam_dp(energy_strip, motion_strip)  # (H,) in strip coords
-
-    # --- Build blend mask -------------------------------------------------
-    blend_mask = _seam_to_blend_mask(
-        seam_cols, x0_ov, (h, w),
-        left_valid, right_valid,
-        feather_px=feather_px,
-    )
-    return blend_mask
+    return seam_right if moving_left else seam_left
 
 
 # ---------------------------------------------------------------------------
@@ -882,9 +724,7 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
                   sigma_max: float = 4.0,
                   auto_crop: bool = False,
                   auto_crop_method: str = "handcrafted",
-                  use_graphcut: bool = True,
-                  motion_threshold: int = 30,
-                  seam_feather: int = 3):
+                  motion_threshold: int = 25):
 
     frame_sentinel = object()
 
@@ -926,7 +766,7 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
 
     # ---- Canvas geometry (computed ONCE) ----------------------------------
     canvas_w, canvas_h, tx, ty = compute_canvas_size(H, sample_left.shape, sample_right.shape)
-    print(f"[Canvas] {canvas_w}×{canvas_h}  offset=({tx},{ty})")
+    print(f"[Canvas] {canvas_w}x{canvas_h}  offset=({tx},{ty})")
 
     # ---- Warp grids (computed ONCE) ---------------------------------------
     left_map_x, left_map_y, right_map_x, right_map_y = prepare_remap_grids(
@@ -940,7 +780,7 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
             H, sample_left.shape, sample_right.shape, canvas_w, canvas_h, tx, ty,
             method=auto_crop_method)
         print(f"[Auto-crop] Crop region: x={crop_x}, y={crop_y}, "
-              f"size={crop_w}×{crop_h} (original canvas: {canvas_w}×{canvas_h})")
+              f"size={crop_w}x{crop_h} (original canvas: {canvas_w}x{canvas_h})")
 
     # ---- VideoWriter -----------------------------------------------------
     output_w = crop_w if auto_crop else canvas_w
@@ -950,45 +790,28 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
     if not writer.isOpened():
         raise IOError(f"Cannot open VideoWriter for: {output_path}")
 
-    # ---- Warp sample frame (used for initial seam) -----------------------
+    # ---- Warp sample frame -----------------------------------------------
     left0_w, right0_w = remap_images(
         sample_left, sample_right,
         left_map_x, left_map_y,
         right_map_x, right_map_y,
     )
 
-    # ---- Seam / blend mask (computed from FIRST frame) -------------------
-    # -----------------------------------------------------------------------
-    # Paper workflow (Section 3.1):
-    #   • First frame  → run graph-cut (or fallback) to find optimal seam.
-    #                    Save the seam label map as a template.
-    #   • Later frames → check if motion crosses the cached seam;
-    #                    update only when needed.
-    # -----------------------------------------------------------------------
-    if use_graphcut:
-        print("[Seam] Computing optimal seam via graph-cut on first frame …")
-        blend_mask = compute_seam_mask_graphcut(
-            left0_w, right0_w,
-            motion_mask=None,
-            feather_px=seam_feather,
-        )
-        print("[Seam] Done.")
-    else:
-        print("[Blend mask] Computing gradient blend mask from first frame …")
-        blend_mask = compute_blend_mask(left0_w, right0_w, blend_width=blend_width)
-        print("[Blend mask] Done.")
+    # ---- Zone boundaries (fixed for fixed cameras) -----------------------
+    seam_left, seam_right = compute_zone_boundaries(left0_w, right0_w)
+    print(f"[Zones] seam_left={seam_left}  seam_right={seam_right}  "
+          f"overlap_width={seam_right - seam_left}px")
 
-    # Cache the seam label map (binary, pre-feathering) for motion checking.
-    # We derive it from blend_mask: pixels > 0.5 → label 1 (left).
-    cached_seam_label: np.ndarray = (blend_mask >= 0.5).astype(np.int32)
+    # ---- Initial seam: use left frontier by default ----------------------
+    current_seam = seam_left
+    blend_mask   = build_blend_mask(current_seam, left0_w, right0_w, blend_width)
+    print(f"[Seam] Initial seam_x={current_seam} (left frontier)")
 
-    # Background model for motion detection (running mean of left channel).
-    bg_model: dict = {"mean": None}
+    # ---- Background model (initialised from sample frame) ----------------
+    bg_gray = cv2.cvtColor(left0_w, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    prev_gray = bg_gray.copy()
 
-    # Pre-compute overlap mask (static for fixed cameras).
-    overlap_mask = _compute_overlap_mask(left0_w, right0_w)
-
-    # Reset to start for the main processing pass.
+    # Reset to start
     cap_left.set(cv2.CAP_PROP_POS_FRAMES, 0)
     cap_right.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
@@ -1023,11 +846,10 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
     writer_thread.start()
 
     # ---- Frame loop ------------------------------------------------------
-    print(f"[Stitching] Processing {total} frames …  "
-          f"(fusion={'graph-cut+motion' if use_graphcut else 'gradient-blend'})")
+    print(f"[Stitching] Processing {total} frames ...")
     t0 = time.time()
-    frame_idx   = 0
-    seam_updates = 0
+    frame_idx    = 0
+    seam_changes = 0
 
     while True:
         item = read_queue.get()
@@ -1035,39 +857,29 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
             break
         frame_left, frame_right = item
 
-        # Warp both frames onto the shared canvas.
+        # Warp both frames onto the shared canvas
         wl, wr = remap_images(
             frame_left, frame_right,
             left_map_x, left_map_y,
             right_map_x, right_map_y,
         )
 
-        # ------------------------------------------------------------------
-        # Motion-aware seam update  (paper Section 3.1, Step B)
-        # ------------------------------------------------------------------
-        if use_graphcut:
-            # Detect moving objects in the overlap region.
-            motion_mask = _detect_motion_region(
-                wl, bg_model, overlap_mask,
-                motion_threshold=motion_threshold,
-            )
+        # --- Motion-aware seam selection ----------------------------------
+        curr_gray    = cv2.cvtColor(wl, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        motion_mask  = detect_motion(curr_gray, bg_gray, threshold=motion_threshold)
+        bg_gray      = update_background(bg_gray, curr_gray)
 
-            # Check whether any motion pixel overlaps the current seam
-            # boundary (pixels where the seam transitions, i.e. near 0.5).
-            seam_boundary = np.abs(blend_mask - 0.5) < 0.25
-            motion_hits_seam = bool((motion_mask & seam_boundary).any())
+        new_seam = choose_seam(motion_mask, prev_gray, curr_gray,
+                               seam_left, seam_right, canvas_w)
 
-            if motion_hits_seam:
-                # Recompute seam restricted to Ω \\ M_Ω  (Eq. 7)
-                blend_mask = compute_seam_mask_graphcut(
-                    wl, wr,
-                    motion_mask=motion_mask,
-                    feather_px=seam_feather,
-                )
-                cached_seam_label = (blend_mask >= 0.5).astype(np.int32)
-                seam_updates += 1
+        if new_seam is not None and new_seam != current_seam:
+            current_seam = new_seam
+            blend_mask   = build_blend_mask(current_seam, wl, wr, blend_width)
+            seam_changes += 1
 
-        # Multi-band blend using the current seam mask.
+        prev_gray = curr_gray
+
+        # Multi-band blend using the current seam mask
         stitched_full = multiband_blend(wl, wr, blend_mask, levels=blend_levels)
 
         if auto_crop:
@@ -1079,10 +891,10 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
         frame_idx += 1
 
         if frame_idx % 30 == 0:
-            elapsed     = time.time() - t0
-            fps_actual  = frame_idx / elapsed
+            elapsed    = time.time() - t0
+            fps_actual = frame_idx / elapsed
             print(f"  {frame_idx}/{total}  ({fps_actual:.1f} fps)  "
-                  f"seam updates: {seam_updates}", end="\r")
+                  f"seam_x={current_seam}  changes={seam_changes}", end="\r")
 
     write_queue.put(frame_sentinel)
     writer_thread.join()
@@ -1090,8 +902,7 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
 
     elapsed = time.time() - t0
     print(f"\n[Done] {frame_idx} frames in {elapsed:.1f}s  "
-          f"({frame_idx/elapsed:.1f} fps avg)  "
-          f"seam recomputations: {seam_updates}")
+          f"({frame_idx/elapsed:.1f} fps avg)  seam changes={seam_changes}")
 
     cap_left.release()
     cap_right.release()
@@ -1129,18 +940,9 @@ def parse_args():
     p.add_argument("--auto-crop-method", type=str, default="handcrafted",
                    choices=["handcrafted", "optimization"],
                    help="Auto-crop method: 'handcrafted' (simple, default) or 'optimization' (future)")
-
-    # ---- Graph-cut / motion-aware seam options --------------------------
-    p.add_argument("--no-graphcut", action="store_true",
-                   help="Disable graph-cut seam search and fall back to the "
-                        "original gradient blend mask.")
-    p.add_argument("--motion-threshold", type=int, default=30,
-                   help="Pixel-wise absolute difference threshold (0-255) used "
-                        "to detect moving objects in the overlap region. "
-                        "Lower = more sensitive (default: 30).")
-    p.add_argument("--seam-feather", type=int, default=3,
-                   help="Half-width in pixels of the feathering zone applied "
-                        "along the graph-cut seam (default: 3).")
+    p.add_argument("--motion-threshold", type=int, default=25,
+                   help="Pixel brightness-change threshold for motion detection (default: 25). "
+                        "Lower = more sensitive, higher = less sensitive.")
     return p.parse_args()
 
 
@@ -1158,7 +960,5 @@ if __name__ == "__main__":
         sigma_max        = args.sigma_max,
         auto_crop        = args.auto_crop,
         auto_crop_method = args.auto_crop_method,
-        use_graphcut     = not args.no_graphcut,
         motion_threshold = args.motion_threshold,
-        seam_feather     = args.seam_feather,
     )
