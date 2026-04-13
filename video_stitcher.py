@@ -11,8 +11,7 @@ Key design decisions:
     matches.  The `sigma_max` parameter is an upper bound on the noise scale (in pixels),
     not a hard cutoff as in RANSAC.
   - Homography is saved to disk so it can be reloaded without recomputing.
-  - Per-frame processing is limited to warping + multi-band blending only → fast pipeline.
-  - Multi-band (Laplacian pyramid) blending for seamless seams.
+    - Per-frame processing is limited to warping + direct compositing only → fast pipeline.
 
 Usage
 -----
@@ -271,68 +270,19 @@ def remap_images(left: np.ndarray, right: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# 3.  MULTI-BAND BLENDING
+# 3.  DIRECT COMPOSITING (NO BLENDING)
 # ---------------------------------------------------------------------------
 
-def build_gaussian_pyramid(img: np.ndarray, levels: int):
-    gp = [img.astype(np.float32)]
-    for _ in range(levels):
-        gp.append(cv2.pyrDown(gp[-1]))
-    return gp
-
-
-def build_laplacian_pyramid(img: np.ndarray, levels: int):
-    gp = build_gaussian_pyramid(img, levels)
-    lp = []
-    for i in range(levels):
-        up = cv2.pyrUp(gp[i + 1], dstsize=(gp[i].shape[1], gp[i].shape[0]))
-        lp.append(gp[i] - up)
-    lp.append(gp[levels])  # coarsest level is kept as-is
-    return lp
-
-
-def blend_laplacian_pyramids(lp1, lp2, mask_gp):
-    """Blend two Laplacian pyramids using a Gaussian mask pyramid."""
-    blended = []
-    for l1, l2, gm in zip(lp1, lp2, mask_gp):
-        # Ensure mask has 3 channels if images do
-        if l1.ndim == 3 and gm.ndim == 2:
-            gm = gm[:, :, np.newaxis]
-        blended.append(l1 * gm + l2 * (1.0 - gm))
-    return blended
-
-
-def reconstruct_from_laplacian(lp):
-    img = lp[-1]
-    for level in reversed(lp[:-1]):
-        img = cv2.pyrUp(img, dstsize=(level.shape[1], level.shape[0]))
-        img = img + level
-    return np.clip(img, 0, 255).astype(np.uint8)
-
-
-def multiband_blend(left_warped: np.ndarray, right_warped: np.ndarray,
-                    mask_left: np.ndarray, levels: int = 6):
+def compose_without_blending(left_warped: np.ndarray, right_warped: np.ndarray):
     """
-    Multi-band (Laplacian pyramid) blending.
+    Compose warped views with a hard seam and no blending.
 
-    mask_left : float32 mask in [0,1], same H×W as the canvas.
-                1 = take from left, 0 = take from right, gradient in between.
+    Right-image valid pixels overwrite left-image pixels.
     """
-    # Clamp pyramid levels to what the image size can support
-    min_dim = min(left_warped.shape[:2])
-    max_levels = int(np.log2(min_dim)) - 1
-    levels = min(levels, max_levels)
-
-    lp_left  = build_laplacian_pyramid(left_warped.astype(np.float32),  levels)
-    lp_right = build_laplacian_pyramid(right_warped.astype(np.float32), levels)
-    gp_mask  = build_gaussian_pyramid(mask_left.astype(np.float32),     levels)
-    # add coarsest level to mask gp
-    gp_mask.append(cv2.pyrDown(gp_mask[-1]) if len(gp_mask) > 0 else mask_left)
-
-    # Align list lengths
-    n = min(len(lp_left), len(lp_right), len(gp_mask))
-    blended_lp = blend_laplacian_pyramids(lp_left[:n], lp_right[:n], gp_mask[:n])
-    return reconstruct_from_laplacian(blended_lp)
+    composed = left_warped.copy()
+    right_valid = np.any(right_warped != 0, axis=2)
+    composed[right_valid] = right_warped[right_valid]
+    return composed
 
 
 def line_segment_intersection_with_vertical(p1, p2, x):
@@ -561,80 +511,6 @@ def find_crop_rectangle_from_corners(H: np.ndarray, left_shape, right_shape,
 
 
 
-def compute_blend_mask(left_warped: np.ndarray, right_warped: np.ndarray,
-                       blend_width: int = 80):
-    """
-    Build a soft alpha mask for multi-band blending.
-
-    Strategy: find the horizontal seam (vertical line where both images overlap)
-    and create a smooth gradient of width `blend_width` pixels around it.
-    Pixels only in the left  → mask = 1
-    Pixels only in the right → mask = 0
-    Overlap region           → smooth gradient 1→0 around the seam
-    """
-    h, w = left_warped.shape[:2]
-
-    # Binary valid-pixel masks
-    left_valid  = (left_warped.sum(axis=2)  > 0).astype(np.float32)
-    right_valid = (right_warped.sum(axis=2) > 0).astype(np.float32)
-    overlap     = (left_valid * right_valid)
-
-    mask = left_valid.copy()
-
-    # For each row, find the horizontal centre of the overlap band
-    for row in range(h):
-        cols = np.where(overlap[row] > 0)[0]
-        if len(cols) == 0:
-            continue
-        seam_x = int(cols.mean())
-        x0 = max(0, seam_x - blend_width // 2)
-        x1 = min(w, seam_x + blend_width // 2)
-        ramp = np.linspace(1.0, 0.0, x1 - x0)
-        mask[row, x0:x1] = ramp
-        mask[row, x1:]   = 0.0  # right side of seam → right image
-
-    # Pixels only in right image: mask = 0 (already)
-    # Pixels only in left image: keep mask = 1
-    mask[right_valid == 0] = 1.0
-    mask[left_valid  == 0] = 0.0
-
-    return mask
-
-
-def refine_blend_mask_for_motion(mask: np.ndarray, left_warped: np.ndarray, right_warped: np.ndarray,
-                                  motion_threshold: float = 0.15):
-    """
-    Refine the blend mask to reduce ghosting from moving objects.
-
-    Where the two warped views have large differences in the overlap zone
-    (indicating motion or misalignment), harden the mask transition to avoid
-    averaging, which would create ghosts.
-    """
-    h, w = left_warped.shape[:2]
-
-    left_valid = (left_warped.sum(axis=2) > 0).astype(np.float32)
-    right_valid = (right_warped.sum(axis=2) > 0).astype(np.float32)
-    overlap = (left_valid * right_valid)
-
-    # Compute per-pixel difference in the overlap zone (normalized to [0,1])
-    left_gray = cv2.cvtColor(left_warped, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-    right_gray = cv2.cvtColor(right_warped, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-    diff = np.abs(left_gray - right_gray) * overlap
-
-    # Threshold: high difference indicates motion
-    motion_mask = (diff > motion_threshold).astype(np.float32)
-
-    # In high-motion regions, harden the mask: push it toward 0 or 1 based on current value
-    refined_mask = mask.copy()
-    refined_mask[motion_mask > 0] = np.where(
-        refined_mask[motion_mask > 0] > 0.5,
-        np.minimum(refined_mask[motion_mask > 0] + 0.2, 1.0),  # Favor left
-        np.maximum(refined_mask[motion_mask > 0] - 0.2, 0.0),  # Favor right
-    )
-
-    return refined_mask
-
-
 # ---------------------------------------------------------------------------
 # 4.  MAIN PIPELINE
 # ---------------------------------------------------------------------------
@@ -643,8 +519,6 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
                   calib_frames: int = 5,
                   homography_path: str = None,
                   save_homography: str = "homography.npy",
-                  blend_levels: int = 6,
-                  blend_width: int = 80,
                   sigma_max: float = 4.0,
                   auto_crop: bool = False,
                   auto_crop_method: str = "handcrafted"):
@@ -714,16 +588,6 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
     if not writer.isOpened():
         raise IOError(f"Cannot open VideoWriter for: {output_path}")
 
-    # ---- Blend mask (computed ONCE on first frame) ------------------------
-    print("[Blend mask] Computing from first frame …")
-    left0_w, right0_w = remap_images(
-        sample_left, sample_right,
-        left_map_x, left_map_y,
-        right_map_x, right_map_y,
-    )
-    blend_mask = compute_blend_mask(left0_w, right0_w, blend_width=blend_width)
-    print("[Blend mask] Done.")
-
     # Reset to start before the threaded processing pass.
     cap_left.set(cv2.CAP_PROP_POS_FRAMES, 0)
     cap_right.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -776,11 +640,8 @@ def stitch_videos(left_path: str, right_path: str, output_path: str,
             right_map_x, right_map_y,
         )
 
-        # Refine mask to reduce ghosting from moving objects
-        dynamic_blend_mask = refine_blend_mask_for_motion(blend_mask, wl, wr)
-
-        # Multi-band blend
-        stitched_full = multiband_blend(wl, wr, dynamic_blend_mask, levels=blend_levels)
+        # Direct composition without blending.
+        stitched_full = compose_without_blending(wl, wr)
 
         # Crop if auto_crop is enabled
         if auto_crop:
@@ -830,10 +691,6 @@ def parse_args():
                    help="MAGSAC++ upper bound on noise std-dev in pixels (default: 4.0). "
                         "Lower (1-2) = stricter, better for clean footage. "
                         "Higher (6-8) = more tolerant of distortion or blur.")
-    p.add_argument("--blend-levels", type=int, default=6,
-                   help="Laplacian pyramid levels for multi-band blending (default: 6)")
-    p.add_argument("--blend-width",  type=int, default=80,
-                   help="Width in pixels of the blending gradient zone (default: 80)")
     p.add_argument("--auto-crop",    action="store_true",
                    help="Automatically crop to largest rectangle using homography corners "
                         "(removes black/empty zones at image edges)")
@@ -852,8 +709,6 @@ if __name__ == "__main__":
         calib_frames     = args.calib_frames,
         homography_path  = args.homography,
         save_homography  = args.save_homography,
-        blend_levels     = args.blend_levels,
-        blend_width      = args.blend_width,
         sigma_max        = args.sigma_max,
         auto_crop        = args.auto_crop,
         auto_crop_method = args.auto_crop_method,
