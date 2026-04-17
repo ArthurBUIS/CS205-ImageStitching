@@ -7,3 +7,5 @@
 stitched.txt
 test
 *.mp4
+*.npy
+/__pycache__/
