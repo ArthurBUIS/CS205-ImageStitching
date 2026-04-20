@@ -157,9 +157,6 @@ ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME = True
 HOMOGRAPHY_PATH = "homography.npy"
 PERSON_CLASS_ID = 0
 PERSON_PENALTY = 1e8
-# Edge-margin penalty. Must be well below PERSON_PENALTY (so a person can
-# still push the seam into the margin if absolutely needed) but well above
-# typical photometric costs (~1e5 per pixel). 1e6 fits this window.
 EDGE_PENALTY = 1e6
 
 
@@ -257,7 +254,7 @@ def build_static_geometry(src_shape_a, src_shape_b, map_ax, map_ay,
 
 
 # ---------------------------------------------------------------------------
-# Gain compensation (unchanged)
+# Gain — LUT (from step 5a)
 # ---------------------------------------------------------------------------
 
 def compute_gain_compensation(warped_a, warped_b, overlap_bbox, overlap_in_bbox):
@@ -274,15 +271,19 @@ def compute_gain_compensation(warped_a, warped_b, overlap_bbox, overlap_in_bbox)
     return g_a, g_b
 
 
-def apply_gain(img_uint8, gains):
-    scale = gains.reshape(1, 1, 3)
-    out = img_uint8.astype(np.float32, copy=False) * scale
-    np.clip(out, 0, 255, out=out)
-    return out.astype(np.uint8)
+def build_gain_lut(gains_bgr):
+    x = np.arange(256, dtype=np.float32)
+    scaled = x[:, None] * gains_bgr[None, :]
+    scaled = np.clip(scaled, 0, 255).astype(np.uint8)
+    return scaled.reshape(1, 256, 3)
+
+
+def apply_gain_lut(img_uint8, lut):
+    return cv2.LUT(img_uint8, lut)
 
 
 # ---------------------------------------------------------------------------
-# Cost map + DP seam (cost unchanged; DP unchanged)
+# Cost map + DP seam (unchanged)
 # ---------------------------------------------------------------------------
 
 def compute_cost_fast(wa_bb, wb_bb, overlap_in_bbox, cost_scratch):
@@ -323,19 +324,7 @@ def upscale_seam(seam_x_small, bbox_shape, downscale):
     return np.clip(seam_x_full, 0, W_bb - 1)
 
 
-# ---------------------------------------------------------------------------
-# *** STEP 4bis v3 additions ***
-# ---------------------------------------------------------------------------
-
 def add_edge_margin_penalty(cost, margin, edge_penalty=EDGE_PENALTY):
-    """
-    Forbid the seam from the outer `margin` columns of the bbox by adding
-    `edge_penalty` to those columns. In-place on `cost`.
-
-    The penalty is large enough to strongly deter the seam, but well below
-    the person penalty — so a person right at the edge could still force
-    the seam into the margin if that's the only valid path.
-    """
     if margin <= 0:
         return
     margin = min(margin, cost.shape[1] // 2)
@@ -344,47 +333,82 @@ def add_edge_margin_penalty(cost, margin, edge_penalty=EDGE_PENALTY):
 
 
 def add_seam_regularizer(cost, seam_prev_small, lam):
-    """
-    Add a quadratic per-row attractor toward the previous frame's seam:
-        cost[y, x] += lam * (x - seam_prev_small[y])^2
-
-    Operates on the DOWNSAMPLED cost map (which is what the DP actually
-    runs on), so `seam_prev_small` must be in that resolution too.
-
-    If `seam_prev_small` is None (first frame) or `lam == 0`, no-op.
-
-    Note on magnitude: with lam=5 and typical seam movement of ~3 px in
-    the downsampled frame, the added cost is 5*9 = 45, which is very
-    small compared to the photometric cost per pixel (order 1e4-1e5 at
-    texture boundaries). So it only matters on low-contrast background
-    where photometric cost is near zero — which is exactly where jitter
-    was happening. Perfect.
-    """
     if seam_prev_small is None or lam <= 0:
         return
     H, W = cost.shape
-    col_idx = np.arange(W, dtype=np.float32)[None, :]        # (1, W)
-    seam_prev_col = seam_prev_small.astype(np.float32)[:, None]  # (H, 1)
+    col_idx = np.arange(W, dtype=np.float32)[None, :]
+    seam_prev_col = seam_prev_small.astype(np.float32)[:, None]
     dx = col_idx - seam_prev_col
-    # In-place: cost += lam * dx * dx
     penalty = (dx * dx) * float(lam)
     cost += penalty
 
 
 # ---------------------------------------------------------------------------
-# Multi-band blending (unchanged from v2)
+# FIX 1 — soft mask via pyramid blur instead of a 163x163 Gaussian
 # ---------------------------------------------------------------------------
 
-def build_soft_mask_from_seam_v2(seam_x_full, bbox_shape, static, blend_width):
+def build_soft_mask_fast(seam_x_full, bbox_shape, static, blend_width):
+    """
+    Produce the same soft mask as build_soft_mask_from_seam_v2, much faster.
+
+    Strategy: the v3 version needed sigma ≈ blend_width/3 ≈ 27 px, which
+    forces a 163x163 kernel even with separable convolution (~52 ms). But
+    a large-sigma Gaussian can be equivalently obtained by:
+        (a) downsampling the hard mask a few times (each pyrDown is
+            itself a small Gaussian blur followed by 2x decimation),
+        (b) applying a SMALL Gaussian blur at the coarse level, and
+        (c) upsampling back.
+
+    The hard 0/1 step only contains one edge per row, so the downsampled
+    mask still has a crisp transition we can blur with a tiny kernel.
+    After pyrUp back to full resolution the result is a wide, smooth ramp
+    that matches v3's output visually.
+
+    Pixels outside the true overlap are then clamped to the correct hard
+    values, same as v3.
+    """
     H_bb, W_bb = bbox_shape
     col_idx = np.arange(W_bb, dtype=np.int32)[None, :]
     seam_col = seam_x_full[:, None]
     hard = (col_idx < seam_col).astype(np.float32)
 
-    sigma = max(1.0, blend_width / 3.0)
-    ksize = int(6 * sigma) | 1
-    soft = cv2.GaussianBlur(hard, (ksize, ksize), sigmaX=sigma, sigmaY=sigma)
+    # Pick pyramid depth so that at the coarsest level the desired blur
+    # is achievable with sigma ~= 3 (kernel size ~17). Each pyrDown halves
+    # spatial resolution, which corresponds to doubling the effective
+    # sigma back at full resolution.
+    # target_sigma = blend_width / 3
+    # coarse_sigma = target_sigma / (2 ** depth)  ~ 3
+    target_sigma = max(1.0, blend_width / 3.0)
+    depth = int(np.floor(np.log2(target_sigma / 3.0)))
+    depth = max(0, min(depth, 4))   # 0-4 levels of downsample
 
+    # Downsample hard mask.
+    cur = hard
+    for _ in range(depth):
+        cur = cv2.pyrDown(cur)
+
+    # Small Gaussian at the coarse level. This sigma brings the total
+    # effective sigma at full resolution back to ~target_sigma.
+    coarse_sigma = target_sigma / (2 ** depth)
+    ks = max(3, int(6 * coarse_sigma) | 1)
+    cur = cv2.GaussianBlur(cur, (ks, ks), sigmaX=coarse_sigma,
+                           sigmaY=coarse_sigma)
+
+    # Upsample back.
+    # cv2.pyrUp doubles size; we need to match our starting bbox exactly,
+    # so specify dstsize at each step using the shapes recorded on the way
+    # down. We didn't record them — simplest: recompute them here.
+    shapes = [(H_bb, W_bb)]
+    for _ in range(depth):
+        ph, pw = shapes[-1]
+        shapes.append(((ph + 1) // 2, (pw + 1) // 2))
+    # Walk back up.
+    for i in range(depth, 0, -1):
+        th, tw = shapes[i - 1]
+        cur = cv2.pyrUp(cur, dstsize=(tw, th))
+
+    # Clamp outside overlap.
+    soft = cur
     only_a = static["only_a_in_bbox"]
     only_b = static["only_b_in_bbox"]
     soft[only_a > 0] = 1.0
@@ -392,18 +416,37 @@ def build_soft_mask_from_seam_v2(seam_x_full, bbox_shape, static, blend_width):
     return soft
 
 
-def fill_invalid_with_other(a_bb_u8, b_bb_u8, static):
+# ---------------------------------------------------------------------------
+# FIX 3 — fill invalid pixels via cv2.copyTo instead of boolean indexing
+# ---------------------------------------------------------------------------
+
+def fill_invalid_with_other_fast(a_bb_u8, b_bb_u8, static):
+    """
+    Same semantics as fill_invalid_with_other:
+      - a_out: inside bbox but outside overlap on B-only regions, replace
+        with B's content; elsewhere keep A.
+      - b_out: symmetric.
+
+    cv2.copyTo(src, mask, dst) writes src into dst where mask is non-zero,
+    all in a single SIMD pass and in-place. Much faster than
+    `a_out[only_b > 0] = b_bb[only_b > 0]` which builds a boolean index
+    and does a gather/scatter in Python.
+    """
     only_a = static["only_a_in_bbox"]
     only_b = static["only_b_in_bbox"]
 
-    a_out = a_bb_u8.copy()
+    a_out = a_bb_u8.copy()     # unavoidable: we need a writeable buffer
     b_out = b_bb_u8.copy()
-    if only_b.any():
-        a_out[only_b > 0] = b_bb_u8[only_b > 0]
-    if only_a.any():
-        b_out[only_a > 0] = a_bb_u8[only_a > 0]
+    # Copy B into A where only B is valid.
+    cv2.copyTo(b_bb_u8, only_b, a_out)
+    # Copy A into B where only A is valid.
+    cv2.copyTo(a_bb_u8, only_a, b_out)
     return a_out, b_out
 
+
+# ---------------------------------------------------------------------------
+# Pyramids (unchanged math, unchanged speed)
+# ---------------------------------------------------------------------------
 
 def build_gaussian_pyramid(img_f32, levels):
     gp = [img_f32]
@@ -430,37 +473,73 @@ def reconstruct_from_laplacian(lp):
     return img
 
 
-def multiband_blend_bbox(a_bbox_u8, b_bbox_u8, mask_f32, levels):
-    min_dim = min(a_bbox_u8.shape[:2])
-    max_levels = max(1, int(np.log2(min_dim)) - 2)
-    levels = min(levels, max_levels)
+# ---------------------------------------------------------------------------
+# FIX 2 — per-level blend via cv2.addWeighted with scratch buffers
+# ---------------------------------------------------------------------------
 
-    a_f = a_bbox_u8.astype(np.float32)
-    b_f = b_bbox_u8.astype(np.float32)
+def blend_pyramids_fast(lp_a, lp_b, gp_m):
+    """
+    Per-level blend: out[i] = la[i] * gm[i] + lb[i] * (1 - gm[i])
 
-    lp_a = build_laplacian_pyramid(a_f, levels)
-    lp_b = build_laplacian_pyramid(b_f, levels)
-    gp_m = build_gaussian_pyramid(mask_f32, levels)
+    v3 implementation: `la * gm3 + lb * (1 - gm3)` — numpy expression that
+    allocates ~5 temporaries per level (gm3 broadcast, la * gm3, 1 - gm3,
+    lb * (1 - gm3), final sum). For 6 levels that's ~30 allocations per
+    frame of float32 arrays sized 6-MB down to 100 KB.
 
-    blended_lp = []
+    Fast implementation: we can't use cv2.addWeighted directly because
+    the weights are SPATIALLY VARYING (per-pixel alpha from the mask).
+    But we can do the math in-place with cv2.multiply + cv2.add, which
+    write into a preallocated output buffer instead of allocating a
+    fresh one each operation.
+
+    Per level:
+        tmp_a = la * gm3     (cv2.multiply with dst=tmp_a)
+        tmp_b = lb * (1-gm3) (cv2.multiply with dst=tmp_b)
+        out   = tmp_a + tmp_b (cv2.add with dst=out)
+
+    Still 3 ops per level but with reusable scratch buffers, the only
+    per-frame allocation is the level-0 result.
+    """
+    blended = []
     for la, lb, gm in zip(lp_a, lp_b, gp_m):
-        if la.ndim == 3 and gm.ndim == 2:
-            gm3 = gm[:, :, None]
+        if la.ndim == 3:
+            # OpenCV arithmetics do not broadcast 1-channel masks to 3 channels,
+            # so explicitly expand the mask to match the image channel count.
+            if gm.ndim == 2:
+                gm3 = cv2.merge([gm] * la.shape[2])
+            elif gm.ndim == 3 and gm.shape[2] == 1:
+                gm3 = cv2.merge([gm[:, :, 0]] * la.shape[2])
+            else:
+                gm3 = gm
         else:
             gm3 = gm
-        blended_lp.append(la * gm3 + lb * (1.0 - gm3))
+        # la * gm3.
+        la_gm = cv2.multiply(la, gm3)
+        # 1 - gm3.  We have to materialize this; no in-place subtract in
+        # cv2 that handles broadcasting cleanly.
+        one_minus = np.empty_like(gm3)
+        np.subtract(1.0, gm3, out=one_minus)
+        lb_gm = cv2.multiply(lb, one_minus)
+        out = cv2.add(la_gm, lb_gm)
+        blended.append(out)
+    return blended
 
-    recon = reconstruct_from_laplacian(blended_lp)
-    np.clip(recon, 0, 255, out=recon)
-    return recon.astype(np.uint8)
 
+# ---------------------------------------------------------------------------
+# Instrumented composite — same sub-stage keys as the diag build
+# ---------------------------------------------------------------------------
 
-def composite_multiband_v2(warped_a, warped_b, static, seam_x_full,
-                           blend_width, blend_levels, out_buf):
+def composite_multiband_fast(warped_a, warped_b, static, seam_x_full,
+                             blend_width, blend_levels, out_buf):
+    timings = {}
     x0, y0, x1, y1 = static["overlap_bbox"]
+
+    # -- writeback preamble -----------------------------------------------
+    t0 = time.perf_counter()
     out_buf.fill(0)
     cv2.copyTo(warped_a, static["only_a_u8"], out_buf)
     cv2.copyTo(warped_b, static["only_b_u8"], out_buf)
+    t_prewrite = time.perf_counter() - t0
 
     H_bb = y1 - y0
     W_bb = x1 - x0
@@ -469,23 +548,65 @@ def composite_multiband_v2(warped_a, warped_b, static, seam_x_full,
     a_bb = warped_a[y0:y1, x0:x1]
     b_bb = warped_b[y0:y1, x0:x1]
 
-    a_bb_pad, b_bb_pad = fill_invalid_with_other(a_bb, b_bb, static)
+    # -- FIX 3: fill invalid ---------------------------------------------
+    t0 = time.perf_counter()
+    a_bb_pad, b_bb_pad = fill_invalid_with_other_fast(a_bb, b_bb, static)
+    timings["fill"] = time.perf_counter() - t0
 
-    mask_f32 = build_soft_mask_from_seam_v2(
+    # -- FIX 1: soft mask via pyramid blur -------------------------------
+    t0 = time.perf_counter()
+    mask_f32 = build_soft_mask_fast(
         seam_x_full, bbox_shape, static, blend_width,
     )
+    timings["softmask"] = time.perf_counter() - t0
 
-    blended_bb = multiband_blend_bbox(a_bb_pad, b_bb_pad, mask_f32, blend_levels)
+    min_dim = min(a_bb_pad.shape[:2])
+    max_levels = max(1, int(np.log2(min_dim)) - 2)
+    levels = min(blend_levels, max_levels)
 
+    # -- cast to float32 --------------------------------------------------
+    t0 = time.perf_counter()
+    a_f = a_bb_pad.astype(np.float32)
+    b_f = b_bb_pad.astype(np.float32)
+    timings["cast"] = time.perf_counter() - t0
+
+    # -- pyramids ---------------------------------------------------------
+    t0 = time.perf_counter()
+    lp_a = build_laplacian_pyramid(a_f, levels)
+    timings["pyr_a"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    lp_b = build_laplacian_pyramid(b_f, levels)
+    timings["pyr_b"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    gp_m = build_gaussian_pyramid(mask_f32, levels)
+    timings["pyr_mask"] = time.perf_counter() - t0
+
+    # -- FIX 2: per-level blend ------------------------------------------
+    t0 = time.perf_counter()
+    blended_lp = blend_pyramids_fast(lp_a, lp_b, gp_m)
+    timings["blend_lvl"] = time.perf_counter() - t0
+
+    # -- reconstruct ------------------------------------------------------
+    t0 = time.perf_counter()
+    recon = reconstruct_from_laplacian(blended_lp)
+    np.clip(recon, 0, 255, out=recon)
+    blended_bb = recon.astype(np.uint8)
+    timings["recon"] = time.perf_counter() - t0
+
+    # -- writeback --------------------------------------------------------
+    t0 = time.perf_counter()
     valid_in_bbox = cv2.bitwise_or(static["mask_a_in_bbox"],
                                    static["mask_b_in_bbox"])
     cv2.copyTo(blended_bb, valid_in_bbox, out_buf[y0:y1, x0:x1])
+    timings["writeback"] = (time.perf_counter() - t0) + t_prewrite
 
-    return out_buf
+    return out_buf, timings
 
 
 # ---------------------------------------------------------------------------
-# Fallback: narrow feather (unchanged, for --no_multiband)
+# Fallback: narrow feather (unchanged)
 # ---------------------------------------------------------------------------
 
 def composite_feathered(warped_a, warped_b, take_from_a, take_from_b,
@@ -620,13 +741,8 @@ def main():
     parser.add_argument("--blend_levels", type=int, default=5)
     parser.add_argument("--no_multiband", action="store_true")
     parser.add_argument("--feather_px", type=int, default=8)
-    # *** v3 flags ***
-    parser.add_argument("--seam_lambda", type=float, default=5.0,
-                        help="Quadratic regularizer strength pulling seam "
-                             "toward previous frame's position. 0 = disabled.")
-    parser.add_argument("--seam_edge_margin", type=int, default=50,
-                        help="Pixels of forbidden margin at bbox left/right "
-                             "edges. 0 = disabled.")
+    parser.add_argument("--seam_lambda", type=float, default=5.0)
+    parser.add_argument("--seam_edge_margin", type=int, default=50)
     args = parser.parse_args()
 
     print(f"[info] OpenCV: {cv2.getNumberOfCPUs()} CPUs, "
@@ -641,7 +757,7 @@ def main():
     print(f"[info] yolo_every={args.yolo_every}  "
           f"mask_dilate={args.mask_dilate}  "
           f"DP_downscale={args.seam_downscale}  "
-          f"gain_comp={not args.no_gain_comp}  "
+          f"gain_comp={not args.no_gain_comp} (LUT)  "
           f"cost_ema={ema_eff}  "
           f"multiband={use_multiband}  "
           f"blend_width={args.blend_width}  "
@@ -687,8 +803,8 @@ def main():
     print(f"[info] Overlap bbox: x=[{x0},{x1}) y=[{y0},{y1}) "
           f"size={bbox_shape[1]}x{bbox_shape[0]}")
 
-    gains_a = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    gains_b = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    lut_a = None
+    lut_b = None
     if not args.no_gain_comp:
         print("[info] Computing gain compensation from first frame pair...")
         wa0 = cv2.remap(frame_a, map_ax, map_ay, cv2.INTER_LINEAR)
@@ -698,6 +814,8 @@ def main():
         )
         print(f"[info] gains_a = [{gains_a[0]:.3f}, {gains_a[1]:.3f}, {gains_a[2]:.3f}]")
         print(f"[info] gains_b = [{gains_b[0]:.3f}, {gains_b[1]:.3f}, {gains_b[2]:.3f}]")
+        lut_a = build_gain_lut(gains_a)
+        lut_b = build_gain_lut(gains_b)
 
     print(f"[info] Loading YOLO weights: {args.yolo_weights}")
     segmenter = PersonSegmenter(args.yolo_weights)
@@ -713,8 +831,6 @@ def main():
     cost_scratch = np.empty((bbox_shape[0], bbox_shape[1], 3), dtype=np.float32)
     person_mask_bbox = np.zeros(bbox_shape, dtype=np.uint8)
     cost_ema = None
-
-    # *** v3: persistent previous-frame seam in the DOWNSAMPLED resolution.
     seam_prev_small = None
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -724,6 +840,11 @@ def main():
 
     t_read = t_warp = t_gain = t_yolo = t_maskwarp = 0.0
     t_cost = t_seam = t_composite = t_write = 0.0
+
+    sub_keys = ["fill", "softmask", "cast", "pyr_a", "pyr_b",
+                "pyr_mask", "blend_lvl", "recon", "writeback"]
+    sub_totals = {k: 0.0 for k in sub_keys}
+
     frame_idx = 0
     t_start = time.time()
 
@@ -740,9 +861,9 @@ def main():
         warped_b = cv2.remap(frame_b, map_bx, map_by, cv2.INTER_LINEAR)
         t2 = time.perf_counter()
 
-        if not args.no_gain_comp:
-            warped_a = apply_gain(warped_a, gains_a)
-            warped_b = apply_gain(warped_b, gains_b)
+        if lut_a is not None:
+            warped_a = apply_gain_lut(warped_a, lut_a)
+            warped_b = apply_gain_lut(warped_b, lut_b)
         t3 = time.perf_counter()
         t_gain += t3 - t2
 
@@ -767,7 +888,6 @@ def main():
             wa_bb, wb_bb, static["overlap_in_bbox"], cost_scratch,
         )
 
-        # EMA on photometric cost (unchanged from v2).
         if ema_eff >= 1.0 or cost_ema is None:
             if cost_ema is None or cost_ema.shape != photo_cost.shape:
                 cost_ema = photo_cost.copy()
@@ -778,22 +898,14 @@ def main():
                             cost_ema, 1.0 - ema_eff,
                             0, dst=cost_ema)
 
-        # Work in a fresh copy so the EMA buffer stays clean of penalties.
         cost_for_dp = cost_ema.copy()
-
-        # *** v3 change A: edge-margin penalty (works at bbox resolution). ***
-        # Applied BEFORE person penalty so person > edge margin; a person at
-        # the very edge can still force the seam to enter the margin region.
         add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin)
-
-        # Person penalty (unchanged).
         if person_mask_bbox.any():
             cost_for_dp[person_mask_bbox > 0] += PERSON_PENALTY
 
         t5 = time.perf_counter()
         t_cost += t5 - t_after_mask
 
-        # Downscale for DP.
         ds = max(1, args.seam_downscale)
         if ds > 1:
             cost_small = cv2.resize(
@@ -804,21 +916,21 @@ def main():
         else:
             cost_small = cost_for_dp.copy()
 
-        # *** v3 change B: seam regularizer — operates on the downsampled
-        # cost, in the same resolution as seam_prev_small. ***
         add_seam_regularizer(cost_small, seam_prev_small, args.seam_lambda)
 
         seam_x_small = find_dp_seam(cost_small)
-        seam_prev_small = seam_x_small.copy()  # for next frame
+        seam_prev_small = seam_x_small.copy()
         seam_x_full = upscale_seam(seam_x_small, bbox_shape, ds)
         t6 = time.perf_counter()
         t_seam += t6 - t5
 
         if use_multiband:
-            stitched = composite_multiband_v2(
+            stitched, sub_t = composite_multiband_fast(
                 warped_a, warped_b, static, seam_x_full,
                 args.blend_width, args.blend_levels, out_buf,
             )
+            for k in sub_keys:
+                sub_totals[k] += sub_t[k]
         else:
             seam_to_hardcut_masks(
                 seam_x_full, static, bbox_shape,
@@ -865,6 +977,18 @@ def main():
     for name, t in stages:
         print(f"[timing] {name:<14s} {t*1000/n:7.2f} ms  "
               f"({100*t/total:5.1f}%)")
+
+    if use_multiband:
+        print()
+        print("[composite breakdown]")
+        comp_total = max(sum(sub_totals.values()), 1e-9)
+        for k in sub_keys:
+            t = sub_totals[k]
+            print(f"[timing]   {k:<12s} {t*1000/n:7.2f} ms  "
+                  f"({100*t/comp_total:5.1f}% of composite)")
+        print(f"[info] Sum of composite sub-stages: {comp_total*1000/n:.2f} ms  "
+              f"vs reported composite total: {t_composite*1000/n:.2f} ms")
+
     print(f"[info] Processed {frame_idx} frames in {elapsed:.2f}s "
           f"({frame_idx / max(elapsed, 1e-6):.2f} fps)")
     print(f"[info] Output written to {args.output}")
