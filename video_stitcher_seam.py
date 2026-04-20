@@ -1,33 +1,138 @@
 """
-Real-time video stitching — Step 4bis v2: multi-band blending with edge fix
-
-Same as step 4bis, with two small fixes that together eliminate the
-visible diagonal artifact at the edge of warped B's footprint:
-
-  Fix 1 — Pyramid edge leakage:
-    Inside the overlap bbox there are pixels where A is valid but B is
-    black (outside B's warped footprint), and vice versa. When we built
-    Laplacian pyramids directly on those images, the black border leaked
-    into neighboring levels and darkened the reconstruction along the
-    edge — producing the diagonal line you saw.
-
-    Fix: before pyramiding, fill each image's invalid-inside-bbox pixels
-    with the OTHER image's content. This makes both pyramids match in
-    those regions, so any residual leakage at pyramid boundaries has no
-    visible effect.
-
-  Fix 2 — Soft mask clamp at the overlap edge:
-    The DP-seam-derived mask was a Gaussian-blurred 0/1 step. That's
-    correct inside the overlap, but outside the overlap (inside the
-    bbox) the blur smeared the mask away from the hard 0 or 1 values
-    it should have there. At coarse pyramid levels this caused the
-    blend to use a little of B where only A was valid.
-
-    Fix: after blurring, force mask = 1 where only A is valid (inside
-    bbox but outside overlap on A's side) and mask = 0 where only B is
-    valid.
-
-Neither fix changes the runtime appreciably.
+Real-time video stitching from two fixed cameras.
+ 
+Stitches two synchronized video streams into a single panorama video, with
+special care taken so that people moving through the seam region are neither
+ghosted, doubled, nor visibly cut.
+ 
+Pipeline overview
+-----------------
+The pipeline has two phases.
+ 
+Startup (runs once):
+    1. Estimate a single homography from the first frame pair.
+    2. Compute the panorama canvas size and precompute pixel-level remap
+       tables so per-frame warping is a single SIMD pass.
+    3. Compute static geometry: validity masks of each warped camera, the
+       overlap region, and its bounding box. All per-frame work will be
+       restricted to this bbox.
+    4. (Optional) Compute per-camera BGR gain scalars for exposure matching.
+    5. Load the YOLO person-segmentation model.
+ 
+Per frame:
+    1. Warp both frames onto the canvas via remap.
+    2. Apply the precomputed BGR gains.
+    3. Run YOLO on both original frames (every N frames); union the two
+       masks on the canvas and dilate — this is the "person mask".
+    4. Compute a photometric cost map (squared BGR difference) over the
+       overlap bbox.
+    5. Smooth the photometric cost across frames via an exponential moving
+       average.
+    6. Inject hard penalties into a fresh copy of the cost: forbid image
+       edges, forbid person pixels.
+    7. Downsample the cost and add a quadratic attractor toward the
+       previous frame's seam (stability regularizer).
+    8. Find the minimum-cost top-to-bottom seam by dynamic programming.
+    9. Build a soft mask from the seam and run multi-band (Laplacian
+       pyramid) blending on the overlap bbox. Hard-copy the rest of the
+       canvas directly from whichever camera is valid.
+    10. Write the resulting frame to the output video.
+ 
+The seam is what keeps people from being cut; the multi-band blend is what
+makes the seam invisible on the background.
+ 
+Command-line arguments
+----------------------
+Required:
+    --video_a PATH              Input video from camera A (left).
+    --video_b PATH              Input video from camera B (right).
+    --output PATH               Output stitched video (.mp4).
+ 
+General:
+    --max_frames N              Process only the first N frames (0 = all).
+                                Useful for quick iteration. Default: 0.
+    --debug_seam                Overlay the DP seam as a red line.
+    --debug_mask                Overlay the person mask as translucent red.
+ 
+Person segmentation (YOLOv8n-seg):
+    --yolo_weights PATH         Path/name of YOLO weights file.
+                                Default: yolov8n-seg.pt (auto-downloaded on
+                                first run, ~7 MB).
+    --yolo_every N              Run YOLO once every N frames; reuse the
+                                cached mask in between. Lower = fresher
+                                mask but slower. Higher = staler mask but
+                                faster. Default: 3.
+    --mask_dilate PX            Dilation radius applied to the unioned
+                                person mask, in pixels. Absorbs the
+                                parallax offset between how camera A and
+                                camera B see the same person. Increase if
+                                the seam sometimes grazes a person's
+                                outline; decrease if the mask engulfs too
+                                much background. Default: 15.
+ 
+Cost-map behavior:
+    --cost_ema A                EMA factor in [0, 1] for the photometric        # EMA stands for Exponential Moving Average
+                                cost. Lower = smoother but slower to react
+                                to genuine scene changes. Higher = more
+                                reactive but jitterier. Default: 0.4.
+    --no_cost_ema               Disable EMA entirely (equivalent to
+                                cost_ema = 1.0). The seam will jitter
+                                frame-to-frame on flat backgrounds.
+    --seam_lambda F             Strength of the quadratic "stay near the
+                                previous seam" attractor. 0 disables it
+                                (first-frame-only behavior). Higher values
+                                pin the seam harder to its previous
+                                position; too high and the seam reacts
+                                sluggishly when a person approaches.
+                                Default: 5.0.
+    --seam_edge_margin N        Width in pixels of the forbidden band at
+                                the left and right edges of the overlap
+                                bbox. Must be at least blend_width / 2,
+                                otherwise the multi-band blur reaches into
+                                padded pixels and produces artifacts.
+                                0 disables. Default: 50.
+ 
+Seam computation:
+    --seam_downscale N          Factor by which the cost map is downscaled
+                                before DP. Higher = much faster DP, but
+                                coarser seam (1 px at small resolution =
+                                N px at full resolution). Default: 4.
+ 
+Gain compensation:
+    --no_gain_comp              Disable global per-channel gain
+                                compensation. With the multi-band blend,
+                                gain comp is partially redundant — its
+                                coarse-level pyramid band already handles
+                                low-frequency exposure matching. Disabling
+                                here saves one pass per frame but may
+                                leave a faint low-frequency color step
+                                depending on the cameras.
+ 
+Composite:
+    --blend_width PX            Width in pixels of the soft mask ramp
+                                around the DP seam. Feeds the Gaussian
+                                pyramid. Must satisfy
+                                seam_edge_margin > blend_width / 2.
+                                Default: 80.
+    --blend_levels N            Laplacian pyramid depth used for the
+                                multi-band blend. Higher = wider
+                                low-frequency blending (better exposure
+                                hiding) at the cost of more pyrDown/pyrUp
+                                per frame. Default: 5.
+    --no_multiband              Fall back to a narrow (2 * feather_px)
+                                linear alpha feather. Much faster; much
+                                more visible seam. For A/B comparison.
+    --feather_px PX             Half-width of the fallback narrow feather
+                                when --no_multiband is set. Default: 8.
+ 
+Usage
+-----
+    python video_stitcher_seam.py --video_a camA.mp4 --video_b camB.mp4 \
+                                 --output stitched.mp4
+ 
+For debugging, add --debug_seam --debug_mask to overlay the seam and
+person mask on the output. Recommended for any first run on a new
+scene.
 """
 
 import argparse
@@ -52,6 +157,10 @@ ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME = True
 HOMOGRAPHY_PATH = "homography.npy"
 PERSON_CLASS_ID = 0
 PERSON_PENALTY = 1e8
+# Edge-margin penalty. Must be well below PERSON_PENALTY (so a person can
+# still push the seam into the margin if absolutely needed) but well above
+# typical photometric costs (~1e5 per pixel). 1e6 fits this window.
+EDGE_PENALTY = 1e6
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +221,6 @@ def build_remap(H, canvas_size):
 
 def build_static_geometry(src_shape_a, src_shape_b, map_ax, map_ay,
                           map_bx, map_by, canvas_size):
-    """
-    Additionally computes per-bbox versions of mask_a and mask_b, which
-    Step 4bis v2 needs for the edge-fill fix.
-    """
     W, H = canvas_size
     src_white_a = np.full(src_shape_a[:2], 255, dtype=np.uint8)
     src_white_b = np.full(src_shape_b[:2], 255, dtype=np.uint8)
@@ -134,10 +239,8 @@ def build_static_geometry(src_shape_a, src_shape_b, map_ax, map_ay,
     x0, x1 = int(cols[0]), int(cols[-1]) + 1
 
     overlap_in_bbox = (overlap_bool[y0:y1, x0:x1].astype(np.uint8)) * 255
-    # *** v2: need A's and B's per-bbox validity for the edge fill. ***
-    mask_a_in_bbox = mask_a[y0:y1, x0:x1].copy()          # uint8 0/255
+    mask_a_in_bbox = mask_a[y0:y1, x0:x1].copy()
     mask_b_in_bbox = mask_b[y0:y1, x0:x1].copy()
-    # Derived masks for convenience inside the blend.
     only_a_in_bbox = ((only_a_bool[y0:y1, x0:x1]).astype(np.uint8)) * 255
     only_b_in_bbox = ((only_b_bool[y0:y1, x0:x1]).astype(np.uint8)) * 255
 
@@ -179,7 +282,7 @@ def apply_gain(img_uint8, gains):
 
 
 # ---------------------------------------------------------------------------
-# Cost map + DP seam (unchanged)
+# Cost map + DP seam (cost unchanged; DP unchanged)
 # ---------------------------------------------------------------------------
 
 def compute_cost_fast(wa_bb, wb_bb, overlap_in_bbox, cost_scratch):
@@ -221,35 +324,67 @@ def upscale_seam(seam_x_small, bbox_shape, downscale):
 
 
 # ---------------------------------------------------------------------------
-# Multi-band blending — v2 with edge fix
+# *** STEP 4bis v3 additions ***
+# ---------------------------------------------------------------------------
+
+def add_edge_margin_penalty(cost, margin, edge_penalty=EDGE_PENALTY):
+    """
+    Forbid the seam from the outer `margin` columns of the bbox by adding
+    `edge_penalty` to those columns. In-place on `cost`.
+
+    The penalty is large enough to strongly deter the seam, but well below
+    the person penalty — so a person right at the edge could still force
+    the seam into the margin if that's the only valid path.
+    """
+    if margin <= 0:
+        return
+    margin = min(margin, cost.shape[1] // 2)
+    cost[:,  :margin]  += edge_penalty
+    cost[:, -margin:] += edge_penalty
+
+
+def add_seam_regularizer(cost, seam_prev_small, lam):
+    """
+    Add a quadratic per-row attractor toward the previous frame's seam:
+        cost[y, x] += lam * (x - seam_prev_small[y])^2
+
+    Operates on the DOWNSAMPLED cost map (which is what the DP actually
+    runs on), so `seam_prev_small` must be in that resolution too.
+
+    If `seam_prev_small` is None (first frame) or `lam == 0`, no-op.
+
+    Note on magnitude: with lam=5 and typical seam movement of ~3 px in
+    the downsampled frame, the added cost is 5*9 = 45, which is very
+    small compared to the photometric cost per pixel (order 1e4-1e5 at
+    texture boundaries). So it only matters on low-contrast background
+    where photometric cost is near zero — which is exactly where jitter
+    was happening. Perfect.
+    """
+    if seam_prev_small is None or lam <= 0:
+        return
+    H, W = cost.shape
+    col_idx = np.arange(W, dtype=np.float32)[None, :]        # (1, W)
+    seam_prev_col = seam_prev_small.astype(np.float32)[:, None]  # (H, 1)
+    dx = col_idx - seam_prev_col
+    # In-place: cost += lam * dx * dx
+    penalty = (dx * dx) * float(lam)
+    cost += penalty
+
+
+# ---------------------------------------------------------------------------
+# Multi-band blending (unchanged from v2)
 # ---------------------------------------------------------------------------
 
 def build_soft_mask_from_seam_v2(seam_x_full, bbox_shape, static, blend_width):
-    """
-    Soft mask in [0, 1] of shape (H_bb, W_bb):
-      - Inside the overlap: Gaussian-softened step around the DP seam
-        (1 left of seam -> 0 right of seam), width ~= blend_width.
-      - Outside the overlap on the A-only side: forced to 1.0.
-      - Outside the overlap on the B-only side: forced to 0.0.
-      - Outside both: 0 (doesn't matter, we don't paint there).
-
-    The hard clamps OUTSIDE the overlap (Fix 2) are what ensure the
-    coarse pyramid levels don't smear the mask across the overlap
-    boundary.
-    """
     H_bb, W_bb = bbox_shape
     col_idx = np.arange(W_bb, dtype=np.int32)[None, :]
     seam_col = seam_x_full[:, None]
     hard = (col_idx < seam_col).astype(np.float32)
 
     sigma = max(1.0, blend_width / 3.0)
-    ksize = int(6 * sigma) | 1  # odd
-    # 2D Gaussian blur (not just horizontal). A wiggly seam needs
-    # vertical smoothing too — otherwise the wiggle survives into
-    # coarse pyramid levels as high-frequency mask content.
+    ksize = int(6 * sigma) | 1
     soft = cv2.GaussianBlur(hard, (ksize, ksize), sigmaX=sigma, sigmaY=sigma)
 
-    # *** FIX 2: clamp outside the overlap to the right hard value. ***
     only_a = static["only_a_in_bbox"]
     only_b = static["only_b_in_bbox"]
     soft[only_a > 0] = 1.0
@@ -258,36 +393,15 @@ def build_soft_mask_from_seam_v2(seam_x_full, bbox_shape, static, blend_width):
 
 
 def fill_invalid_with_other(a_bb_u8, b_bb_u8, static):
-    """
-    *** FIX 1: eliminate edge leakage in the Laplacian pyramid. ***
-
-    Inside the overlap bbox there are regions where only A or only B is
-    valid. If we feed those images to the Laplacian pyramid as-is, the
-    black borders produce high-frequency ringing that leaks across
-    pyramid levels and darkens the reconstruction near the edges.
-
-    Instead, we build "padded" versions:
-      - a_bb where A is invalid is filled with B's content
-      - b_bb where B is invalid is filled with A's content
-    Now both pyramids carry a continuous signal across the overlap
-    boundary and the Laplacian bands match outside the overlap, so
-    the final blend is determined entirely by the mask.
-
-    Returns (a_bb_padded, b_bb_padded), both uint8.
-    """
     only_a = static["only_a_in_bbox"]
     only_b = static["only_b_in_bbox"]
 
     a_out = a_bb_u8.copy()
     b_out = b_bb_u8.copy()
-
-    # Where only B is valid (A is black), copy B into A.
     if only_b.any():
         a_out[only_b > 0] = b_bb_u8[only_b > 0]
-    # Where only A is valid (B is black), copy A into B.
     if only_a.any():
         b_out[only_a > 0] = a_bb_u8[only_a > 0]
-
     return a_out, b_out
 
 
@@ -317,11 +431,6 @@ def reconstruct_from_laplacian(lp):
 
 
 def multiband_blend_bbox(a_bbox_u8, b_bbox_u8, mask_f32, levels):
-    """
-    Unchanged math from step 4bis — but it now receives PADDED a_bbox and
-    b_bbox (no black borders), and a mask that is correctly clamped to
-    0/1 outside the overlap.
-    """
     min_dim = min(a_bbox_u8.shape[:2])
     max_levels = max(1, int(np.log2(min_dim)) - 2)
     levels = min(levels, max_levels)
@@ -346,22 +455,9 @@ def multiband_blend_bbox(a_bbox_u8, b_bbox_u8, mask_f32, levels):
     return recon.astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# Per-frame composite
-# ---------------------------------------------------------------------------
-
 def composite_multiband_v2(warped_a, warped_b, static, seam_x_full,
                            blend_width, blend_levels, out_buf):
-    """
-    Full composite:
-      1. Hard-copy A / B into the canvas outside the overlap (cheap).
-      2. Inside the overlap bbox: pad both images (fill invalid with the
-         other's content), build a soft DP-seam-based mask correctly
-         clamped outside the overlap, Laplacian-blend, write back.
-    """
     x0, y0, x1, y1 = static["overlap_bbox"]
-
-    # Outside-bbox hard copies.
     out_buf.fill(0)
     cv2.copyTo(warped_a, static["only_a_u8"], out_buf)
     cv2.copyTo(warped_b, static["only_b_u8"], out_buf)
@@ -370,23 +466,17 @@ def composite_multiband_v2(warped_a, warped_b, static, seam_x_full,
     W_bb = x1 - x0
     bbox_shape = (H_bb, W_bb)
 
-    # Crop bbox slices.
     a_bb = warped_a[y0:y1, x0:x1]
     b_bb = warped_b[y0:y1, x0:x1]
 
-    # *** FIX 1: pad both images before pyramiding. ***
     a_bb_pad, b_bb_pad = fill_invalid_with_other(a_bb, b_bb, static)
 
-    # Soft mask from the DP seam, with overlap-edge clamps (FIX 2).
     mask_f32 = build_soft_mask_from_seam_v2(
         seam_x_full, bbox_shape, static, blend_width,
     )
 
-    # Multi-band blend.
     blended_bb = multiband_blend_bbox(a_bb_pad, b_bb_pad, mask_f32, blend_levels)
 
-    # Write back only where EITHER A or B was valid in the bbox.
-    # This avoids writing into the out-of-any-camera corners of the bbox.
     valid_in_bbox = cv2.bitwise_or(static["mask_a_in_bbox"],
                                    static["mask_b_in_bbox"])
     cv2.copyTo(blended_bb, valid_in_bbox, out_buf[y0:y1, x0:x1])
@@ -395,7 +485,7 @@ def composite_multiband_v2(warped_a, warped_b, static, seam_x_full,
 
 
 # ---------------------------------------------------------------------------
-# Fallback: narrow feather (from step 4d, for --no_multiband A/B)
+# Fallback: narrow feather (unchanged, for --no_multiband)
 # ---------------------------------------------------------------------------
 
 def composite_feathered(warped_a, warped_b, take_from_a, take_from_b,
@@ -530,6 +620,13 @@ def main():
     parser.add_argument("--blend_levels", type=int, default=5)
     parser.add_argument("--no_multiband", action="store_true")
     parser.add_argument("--feather_px", type=int, default=8)
+    # *** v3 flags ***
+    parser.add_argument("--seam_lambda", type=float, default=5.0,
+                        help="Quadratic regularizer strength pulling seam "
+                             "toward previous frame's position. 0 = disabled.")
+    parser.add_argument("--seam_edge_margin", type=int, default=50,
+                        help="Pixels of forbidden margin at bbox left/right "
+                             "edges. 0 = disabled.")
     args = parser.parse_args()
 
     print(f"[info] OpenCV: {cv2.getNumberOfCPUs()} CPUs, "
@@ -549,6 +646,8 @@ def main():
           f"multiband={use_multiband}  "
           f"blend_width={args.blend_width}  "
           f"blend_levels={args.blend_levels}")
+    print(f"[info] seam_lambda={args.seam_lambda}  "
+          f"seam_edge_margin={args.seam_edge_margin}")
 
     cap_a = cv2.VideoCapture(args.video_a)
     cap_b = cv2.VideoCapture(args.video_b)
@@ -615,6 +714,9 @@ def main():
     person_mask_bbox = np.zeros(bbox_shape, dtype=np.uint8)
     cost_ema = None
 
+    # *** v3: persistent previous-frame seam in the DOWNSAMPLED resolution.
+    seam_prev_small = None
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(args.output, fourcc, fps, canvas_size)
     if not writer.isOpened():
@@ -665,6 +767,7 @@ def main():
             wa_bb, wb_bb, static["overlap_in_bbox"], cost_scratch,
         )
 
+        # EMA on photometric cost (unchanged from v2).
         if ema_eff >= 1.0 or cost_ema is None:
             if cost_ema is None or cost_ema.shape != photo_cost.shape:
                 cost_ema = photo_cost.copy()
@@ -675,12 +778,22 @@ def main():
                             cost_ema, 1.0 - ema_eff,
                             0, dst=cost_ema)
 
+        # Work in a fresh copy so the EMA buffer stays clean of penalties.
         cost_for_dp = cost_ema.copy()
+
+        # *** v3 change A: edge-margin penalty (works at bbox resolution). ***
+        # Applied BEFORE person penalty so person > edge margin; a person at
+        # the very edge can still force the seam to enter the margin region.
+        add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin)
+
+        # Person penalty (unchanged).
         if person_mask_bbox.any():
             cost_for_dp[person_mask_bbox > 0] += PERSON_PENALTY
+
         t5 = time.perf_counter()
         t_cost += t5 - t_after_mask
 
+        # Downscale for DP.
         ds = max(1, args.seam_downscale)
         if ds > 1:
             cost_small = cv2.resize(
@@ -689,8 +802,14 @@ def main():
                 interpolation=cv2.INTER_AREA,
             )
         else:
-            cost_small = cost_for_dp
+            cost_small = cost_for_dp.copy()
+
+        # *** v3 change B: seam regularizer — operates on the downsampled
+        # cost, in the same resolution as seam_prev_small. ***
+        add_seam_regularizer(cost_small, seam_prev_small, args.seam_lambda)
+
         seam_x_small = find_dp_seam(cost_small)
+        seam_prev_small = seam_x_small.copy()  # for next frame
         seam_x_full = upscale_seam(seam_x_small, bbox_shape, ds)
         t6 = time.perf_counter()
         t_seam += t6 - t5
