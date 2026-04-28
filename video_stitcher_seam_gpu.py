@@ -1,33 +1,46 @@
 """
-Real-time video stitching from two fixed cameras — GPU-optimized v4.
+Real-time video stitching from two fixed cameras — v5: FPS desync handling.
 
-Same as v3, with gain application moved to GPU:
+Same as v4, with one structural change: the two input videos are no
+longer assumed to have identical frame rates. A new FrameSyncReader
+pairs each output frame with the temporally-nearest frame from each
+camera, dropping frames from the faster stream as needed.
 
-  Gain on GPU (folded into warp upload):
-    Previously (~8 ms/frame on CPU): cv2.LUT walked every pixel of
-    both input frames through a (1,256,3) lookup table. This is
-    memory-bandwidth bound on CPU.
+Why this matters
+----------------
+If camera A records at 26.43 fps and camera B at 25.37 fps, then after
+N frames their timestamps diverge by N * (1/25.37 - 1/26.43) seconds.
+At N=600 (~24 seconds at the slower rate), the divergence is roughly
+1 second. cv2.VideoCapture.read() doesn't know about timestamps, so
+naive lockstep reading produces frame pairs that represent different
+real-world moments — visible as e.g. two YOLO masks for the same person
+appearing at different positions in the stitched output.
 
-    Now: the per-channel gains are stored as a (3,) float32 tensor on
-    GPU. When we upload the frame for warp (which we were already
-    doing), we apply the gain in a single tensor op BEFORE grid_sample.
-    There's no new upload — we just piggy-back the gain application
-    onto the existing warp upload.
+How FrameSyncReader works
+-------------------------
+At startup it reads each video's nominal FPS via CAP_PROP_FPS. The
+slower stream is designated the "driver" — its frames are output
+verbatim, one per pipeline iteration. The faster stream is the
+"follower"; for each driver frame at timestamp t, the reader
+advances through the follower until it lands on the frame whose
+timestamp is closest to t.
 
-    Expected savings: ~7 ms (8.4 -> ~1 ms). The gain application on
-    GPU is a simple broadcast multiply + clamp, essentially free
-    compared to the grid_sample that follows it.
+If the FPS values match within DESYNC_TOLERANCE (default 0.5%), the
+reader degrades to identical-lockstep behavior — no frames dropped,
+no overhead.
 
-What this means for accuracy:
-    The CPU LUT did u8 -> LUT -> u8 with integer arithmetic
-    (clamping in the LUT table itself). The GPU version does
-    u8 -> float -> multiply by float gains -> clamp(0, 255) ->
-    stays float through grid_sample -> clamp back to u8 at the
-    end of warp_gpu. The intermediate float representation is
-    actually MORE accurate than the u8 LUT path, so any difference
-    in output is negligible and in our favor.
+Output FPS = the slower input FPS. We never duplicate frames; we
+only drop them. That's the cleaner direction (no stutter) and
+matches what the user asked for.
 
-Pipeline overview, CLI flags, and usage: see video_stitcher_seam.py.
+Limits of this approach
+-----------------------
+This corrects nominal-rate mismatch (the dominant cause of multi-cam
+desync). It cannot correct intra-stream jitter (frames arriving
+non-uniformly within a stream) or wall-clock drift unrelated to FPS
+declarations. For those, audio cross-correlation or hardware sync
+would be needed. For typical webcam-class recordings with declared
+but mismatched FPS, this is sufficient.
 """
 
 import argparse
@@ -52,6 +65,155 @@ HOMOGRAPHY_PATH = "homography.npy"
 PERSON_CLASS_ID = 0
 PERSON_PENALTY = 1e8
 EDGE_PENALTY = 1e6
+
+# If two FPS values are within this fractional tolerance, treat them as equal
+# and skip the desync logic entirely.
+DESYNC_TOLERANCE = 0.005   # 0.5%
+
+
+# ---------------------------------------------------------------------------
+# *** NEW: FrameSyncReader — handles FPS mismatch ***
+# ---------------------------------------------------------------------------
+
+class FrameSyncReader:
+    """
+    Reads paired frames from two cv2.VideoCapture objects whose nominal
+    FPS may differ. The slower stream is the "driver" (one frame per
+    output tick); the faster stream is the "follower" (advance to the
+    closest-in-time frame, drop intermediates).
+
+    If the two FPS values match within DESYNC_TOLERANCE, falls through
+    to a plain lockstep read with zero overhead.
+
+    Usage:
+        reader = FrameSyncReader(cap_a, cap_b, fps_a, fps_b)
+        print(reader.summary())
+        while True:
+            ok, frame_a, frame_b = reader.read()
+            if not ok:
+                break
+            ...
+        print(reader.summary_post())   # optional: drop counts
+
+    Properties exposed:
+        output_fps : the FPS to use for the output video writer.
+    """
+
+    def __init__(self, cap_a, cap_b, fps_a, fps_b):
+        self.cap_a = cap_a
+        self.cap_b = cap_b
+        self.fps_a = float(fps_a)
+        self.fps_b = float(fps_b)
+
+        # Detect mismatch.
+        if self.fps_a <= 0 or self.fps_b <= 0:
+            raise RuntimeError(f"Invalid FPS values: A={self.fps_a}, B={self.fps_b}")
+
+        rel_diff = abs(self.fps_a - self.fps_b) / max(self.fps_a, self.fps_b)
+        self.desync_active = rel_diff > DESYNC_TOLERANCE
+
+        if self.desync_active:
+            # Driver = slower (we read 1:1 from it). Follower = faster.
+            if self.fps_a < self.fps_b:
+                self._driver_label = "A"
+                self._follower_label = "B"
+                self._fps_driver = self.fps_a
+                self._fps_follower = self.fps_b
+            else:
+                self._driver_label = "B"
+                self._follower_label = "A"
+                self._fps_driver = self.fps_b
+                self._fps_follower = self.fps_a
+        else:
+            self._driver_label = None
+            self._follower_label = None
+            self._fps_driver = min(self.fps_a, self.fps_b)
+            self._fps_follower = max(self.fps_a, self.fps_b)
+
+        self.output_fps = self._fps_driver
+
+        # Counters (used for stats and for the matching arithmetic).
+        self._driver_idx = 0          # next driver index to read
+        self._follower_idx = 0        # next follower index to read
+        self._dropped_count = 0       # number of follower frames discarded
+
+    def summary(self):
+        if self.desync_active:
+            return (f"[sync] FPS mismatch detected: A={self.fps_a:.3f}, "
+                    f"B={self.fps_b:.3f} (diff={100*abs(self.fps_a-self.fps_b)/max(self.fps_a, self.fps_b):.2f}%). "
+                    f"Driver={self._driver_label} ({self._fps_driver:.3f} fps), "
+                    f"Follower={self._follower_label} ({self._fps_follower:.3f} fps). "
+                    f"Output FPS = {self.output_fps:.3f}.")
+        else:
+            return (f"[sync] FPS match (A={self.fps_a:.3f}, B={self.fps_b:.3f}). "
+                    f"Lockstep read. Output FPS = {self.output_fps:.3f}.")
+
+    def summary_post(self):
+        if self.desync_active:
+            return (f"[sync] Read {self._driver_idx} driver frames from "
+                    f"{self._driver_label}, {self._follower_idx} follower frames "
+                    f"from {self._follower_label}, dropped {self._dropped_count} "
+                    f"follower frames to maintain temporal alignment.")
+        else:
+            return (f"[sync] Read {self._driver_idx} pairs in lockstep "
+                    f"(no frames dropped).")
+
+    def read(self):
+        """
+        Returns (ok, frame_a, frame_b).
+        ok is False when either stream runs out.
+        """
+        if not self.desync_active:
+            ok_a, fa = self.cap_a.read()
+            ok_b, fb = self.cap_b.read()
+            if not (ok_a and ok_b):
+                return False, None, None
+            self._driver_idx += 1
+            self._follower_idx += 1
+            return True, fa, fb
+
+        # Desync path.
+        # 1. Read the next driver frame.
+        cap_driver = self.cap_a if self._driver_label == "A" else self.cap_b
+        cap_follower = self.cap_b if self._driver_label == "A" else self.cap_a
+        ok_d, frame_driver = cap_driver.read()
+        if not ok_d:
+            return False, None, None
+
+        # The driver frame's timestamp is (driver_idx) / fps_driver.
+        # Note: we use driver_idx BEFORE incrementing, because the frame
+        # we just read corresponds to that index.
+        driver_t = self._driver_idx / self._fps_driver
+        self._driver_idx += 1
+
+        # 2. Advance the follower to the frame whose timestamp is closest
+        # to driver_t. The follower's frame i has timestamp i / fps_follower.
+        # We want the integer i minimizing |i/fps_follower - driver_t|, i.e.
+        # the round() of (driver_t * fps_follower).
+        target_follower_idx = int(round(driver_t * self._fps_follower))
+        # We must read at least once (can't skip the current frame and then
+        # not consume any), and we must consume exactly enough to reach
+        # target_follower_idx + 1 (i.e., next position is target+1, last
+        # consumed is target).
+        # _follower_idx is the index of the NEXT frame to read.
+        # We need to read frames until we've consumed index target_follower_idx.
+        while self._follower_idx < target_follower_idx:
+            ok_f, _ = cap_follower.read()
+            if not ok_f:
+                return False, None, None
+            self._follower_idx += 1
+            self._dropped_count += 1
+        # Now read the target frame itself.
+        ok_f, frame_follower = cap_follower.read()
+        if not ok_f:
+            return False, None, None
+        self._follower_idx += 1
+
+        # 3. Map back to (frame_a, frame_b) regardless of which is driver.
+        if self._driver_label == "A":
+            return True, frame_driver, frame_follower
+        else:
+            return True, frame_follower, frame_driver
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +355,7 @@ def build_static_geometry(src_shape_a, src_shape_b, map_ax, map_ay,
 
 
 # ---------------------------------------------------------------------------
-# Gain compensation — computation at startup is unchanged. Per-frame
-# application on CPU (fallback) uses cv2.LUT; on GPU it's folded into warp.
+# Gain compensation
 # ---------------------------------------------------------------------------
 
 def compute_gain_compensation(warped_a, warped_b, overlap_bbox, overlap_in_bbox):
@@ -212,7 +373,6 @@ def compute_gain_compensation(warped_a, warped_b, overlap_bbox, overlap_in_bbox)
 
 
 def build_gain_lut(gains_bgr):
-    """CPU fallback: build a (1, 256, 3) uint8 LUT for cv2.LUT."""
     x = np.arange(256, dtype=np.float32)
     scaled = x[:, None] * gains_bgr[None, :]
     scaled = np.clip(scaled, 0, 255).astype(np.uint8)
@@ -220,22 +380,16 @@ def build_gain_lut(gains_bgr):
 
 
 def apply_gain_lut(img_uint8, lut):
-    """CPU fallback."""
     return cv2.LUT(img_uint8, lut)
 
 
 def build_gain_tensor(gains_bgr, device):
-    """
-    GPU path: return a (1, 3, 1, 1) float32 tensor on `device` that
-    can broadcast-multiply a (1, 3, H, W) float32 frame tensor.
-    """
-    # gains_bgr shape (3,) -> (1, 3, 1, 1) for broadcasting over H, W.
     t = torch.from_numpy(gains_bgr).to(device).view(1, 3, 1, 1)
     return t
 
 
 # ---------------------------------------------------------------------------
-# GPU warp via grid_sample, with optional fused gain application
+# GPU warp
 # ---------------------------------------------------------------------------
 
 def build_grid_sample_tensor(map_x, map_y, src_shape, device):
@@ -248,16 +402,9 @@ def build_grid_sample_tensor(map_x, map_y, src_shape, device):
 
 
 def warp_gpu(frame_bgr_cpu, grid_t, device, gain_t=None, non_blocking=True):
-    """
-    Upload a CPU BGR uint8 frame and warp it to the canvas.
-    If gain_t is provided, multiply by it BEFORE warping — a broadcast
-    multiply that costs essentially nothing on GPU but saves ~8 ms/frame
-    compared to doing gain on CPU.
-    """
     t = torch.from_numpy(frame_bgr_cpu).to(device, non_blocking=non_blocking)
-    t = t.permute(2, 0, 1).unsqueeze(0).float()   # (1, 3, H_src, W_src)
+    t = t.permute(2, 0, 1).unsqueeze(0).float()
     if gain_t is not None:
-        # Broadcast: (1, 3, H, W) * (1, 3, 1, 1) -> (1, 3, H, W)
         t = t * gain_t
         t = t.clamp(0, 255)
     warped = F.grid_sample(
@@ -271,7 +418,7 @@ def warp_gpu(frame_bgr_cpu, grid_t, device, gain_t=None, non_blocking=True):
 
 
 # ---------------------------------------------------------------------------
-# GPU mask warp + dilation (unchanged from v3)
+# GPU mask warp + dilation
 # ---------------------------------------------------------------------------
 
 def warp_mask_gpu(mask_t, grid_t):
@@ -298,7 +445,7 @@ def dilate_gpu(mask_u8_t, radius):
 
 
 # ---------------------------------------------------------------------------
-# GPU cost + EMA (unchanged from v2)
+# GPU cost + EMA
 # ---------------------------------------------------------------------------
 
 def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
@@ -335,7 +482,7 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
 
 
 # ---------------------------------------------------------------------------
-# DP seam + seam utilities (CPU, unchanged)
+# DP seam + utilities
 # ---------------------------------------------------------------------------
 
 def find_dp_seam(cost):
@@ -386,10 +533,6 @@ def add_seam_regularizer(cost, seam_prev_small, lam):
     cost += penalty
 
 
-# ---------------------------------------------------------------------------
-# Soft mask (CPU, unchanged)
-# ---------------------------------------------------------------------------
-
 def build_soft_mask_fast(seam_x_full, bbox_shape, static, blend_width):
     H_bb, W_bb = bbox_shape
     col_idx = np.arange(W_bb, dtype=np.int32)[None, :]
@@ -425,7 +568,7 @@ def build_soft_mask_fast(seam_x_full, bbox_shape, static, blend_width):
 
 
 # ---------------------------------------------------------------------------
-# GPU composite (unchanged from v2/v3)
+# GPU composite
 # ---------------------------------------------------------------------------
 
 _PYR_KERNEL_1D = torch.tensor([1, 4, 6, 4, 1], dtype=torch.float32) / 16.0
@@ -547,7 +690,7 @@ def composite_multiband_gpu_resident(warped_a_t, warped_b_t, static, seam_x_full
 
 
 # ---------------------------------------------------------------------------
-# CPU fallback composite + cost + feather (unchanged)
+# CPU fallback composite + cost
 # ---------------------------------------------------------------------------
 
 def compute_cost_fast_cpu(wa_bb, wb_bb, overlap_in_bbox, cost_scratch):
@@ -707,7 +850,7 @@ def seam_to_hardcut_masks(seam_x_full, static, bbox_shape,
 
 
 # ---------------------------------------------------------------------------
-# YOLO — with GPU-side output option
+# YOLO
 # ---------------------------------------------------------------------------
 
 class PersonSegmenter:
@@ -892,12 +1035,17 @@ def main():
     cap_b = cv2.VideoCapture(args.video_b)
     if not cap_a.isOpened() or not cap_b.isOpened():
         raise RuntimeError("Could not open one of the input videos.")
-    fps = cap_a.get(cv2.CAP_PROP_FPS) or 25.0
+    fps_a = cap_a.get(cv2.CAP_PROP_FPS) or 25.0
+    fps_b = cap_b.get(cv2.CAP_PROP_FPS) or 25.0
 
-    ok_a, frame_a = cap_a.read()
-    ok_b, frame_b = cap_b.read()
-    if not (ok_a and ok_b):
-        raise RuntimeError("Could not read first frame.")
+    # *** NEW: FPS-aware frame reader ***
+    sync_reader = FrameSyncReader(cap_a, cap_b, fps_a, fps_b)
+    print(sync_reader.summary())
+
+    # Read the first paired frame (used for homography + gain seed).
+    ok, frame_a, frame_b = sync_reader.read()
+    if not ok:
+        raise RuntimeError("Could not read first frame pair.")
 
     if ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME:
         print("[info] Estimating homography from first frame pair...")
@@ -926,8 +1074,6 @@ def main():
     print(f"[info] Overlap bbox: x=[{x0},{x1}) y=[{y0},{y1}) "
           f"size={bbox_shape[1]}x{bbox_shape[0]}")
 
-    # --- Gain setup -------------------------------------------------------
-    # CPU fallback still uses a LUT; GPU uses a (1,3,1,1) tensor.
     lut_a = None
     lut_b = None
     gain_a_t = None
@@ -955,7 +1101,6 @@ def main():
         (2 * args.mask_dilate + 1, 2 * args.mask_dilate + 1),
     )
 
-    # --- GPU setup --------------------------------------------------------
     gpu_ctx = None
     grid_a_t = None
     grid_b_t = None
@@ -993,7 +1138,8 @@ def main():
     seam_prev_small = None
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    raw_writer = cv2.VideoWriter(args.output, fourcc, fps, canvas_size)
+    # *** Output FPS now comes from the FrameSyncReader ***
+    raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, canvas_size)
     if not raw_writer.isOpened():
         raise RuntimeError(f"Could not open output writer for {args.output}")
     writer = ThreadedVideoWriter(raw_writer, queue_depth=4)
@@ -1007,27 +1153,19 @@ def main():
         while True:
             tt = time.perf_counter()
             if frame_idx > 0:
-                ok_a, frame_a = cap_a.read()
-                ok_b, frame_b = cap_b.read()
-                if not (ok_a and ok_b):
+                # Use the FPS-aware reader.
+                ok, frame_a, frame_b = sync_reader.read()
+                if not ok:
                     break
             t1 = time.perf_counter()
 
-            # ---- Gain + Warp --------------------------------------------
-            # On GPU: gain is folded into warp_gpu. On CPU: gain runs
-            # here as a separate LUT pass, then we warp the result.
             if dev["cuda_available"]:
-                # Gain is applied inside warp_gpu via the gain_t parameter.
-                # No separate CPU LUT pass; no separate timing line for gain.
                 warped_a_t = warp_gpu(frame_a, grid_a_t, gpu_ctx["device"],
                                       gain_t=gain_a_t)
                 warped_b_t = warp_gpu(frame_b, grid_b_t, gpu_ctx["device"],
                                       gain_t=gain_b_t)
                 warped_a = None
                 warped_b = None
-                # "gain" timing stays at 0 on GPU path — the cost is folded
-                # into warp. We don't introduce a sync point here just for
-                # timing accuracy.
             else:
                 if lut_a is not None:
                     frame_a_g = apply_gain_lut(frame_a, lut_a)
@@ -1040,14 +1178,11 @@ def main():
                 warped_a = cv2.remap(frame_a_g, map_ax, map_ay, cv2.INTER_LINEAR)
                 warped_b = cv2.remap(frame_b_g, map_bx, map_by, cv2.INTER_LINEAR)
             t3 = time.perf_counter()
-            # On GPU, t_warp covers the entire upload+gain+warp cost.
-            # On CPU, t_warp is just cv2.remap (gain was counted separately above).
             if dev["cuda_available"]:
                 t_warp += t3 - t1
             else:
                 t_warp += t3 - t_gain_end
 
-            # ---- YOLO + mask warp + dilation ----------------------------
             if frame_idx % args.yolo_every == 0:
                 if dev["cuda_available"]:
                     mask_a_src_t = segmenter.predict_mask_gpu(
@@ -1080,7 +1215,6 @@ def main():
             else:
                 t_after_mask = t3
 
-            # ---- Cost + EMA ---------------------------------------------
             if dev["cuda_available"]:
                 static_t = {"overlap_in_bbox": overlap_in_bbox_t}
                 has_person = (person_mask_bbox_t.any().item()
@@ -1197,10 +1331,10 @@ def main():
         print(f"[timing] {name:<14s} {t*1000/n:7.2f} ms  "
               f"({100*t/total:5.1f}%)")
     if dev["cuda_available"]:
-        print("[info] On GPU path, gain is folded into warp — gain timing "
-              "is 0.00 ms and warp includes the gain step.")
+        print("[info] On GPU path, gain is folded into warp.")
     print(f"[info] Processed {frame_idx} frames in {elapsed:.2f}s "
           f"({frame_idx / max(elapsed, 1e-6):.2f} fps)")
+    print(sync_reader.summary_post())
     print(f"[info] Output written to {args.output}")
 
     cap_a.release()
