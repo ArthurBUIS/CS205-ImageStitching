@@ -451,6 +451,7 @@ def dilate_gpu(mask_u8_t, radius):
 def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
                              cost_ema_t, ema_alpha, person_mask_bbox_t,
                              fg_mask_bbox_t, fg_penalty,
+                             fg_forbid_bbox_t,
                              overlap_bbox):
     """
     GPU cost + EMA + penalty injection.
@@ -492,6 +493,13 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
             fg_only = fg_mask_bbox_t
         cost_for_dp = torch.where(fg_only > 0,
                                   cost_for_dp + fg_penalty,
+                                  cost_for_dp)
+    # Hard forbid: per-blob "wrong side" zones from L/R decisions.
+    # We use 1e9 (same as outside-overlap), making this region uncrossable.
+    if fg_forbid_bbox_t is not None:
+        cost_for_dp = torch.where(fg_forbid_bbox_t > 0,
+                                  torch.tensor(1e9, device=cost_for_dp.device,
+                                               dtype=cost_for_dp.dtype),
                                   cost_for_dp)
     if person_mask_bbox_t is not None:
         cost_for_dp = torch.where(person_mask_bbox_t > 0,
@@ -911,6 +919,143 @@ def compute_fg_mask_seg_gpu(segmenter, frame_a, frame_b, class_ids,
                                  torch.zeros_like(fg_mask_bbox_t))
     return fg_mask_bbox_t
 
+def _apply_sticky_decisions(fg_mask_bbox_t, prior_decisions, bbox_shape):
+    """
+    Like compute_fg_forbid_mask, but instead of deciding sides from a
+    seam, reuses sides from a prior decision list. Each new blob is
+    matched to a prior decision by spatial overlap (bbox-IoU). New blobs
+    with no prior match fall back to bbox-center heuristic.
+    """
+    H_bb, W_bb = bbox_shape
+    device = fg_mask_bbox_t.device
+
+    fg_cpu = fg_mask_bbox_t.cpu().numpy()
+    forbid_cpu = np.zeros_like(fg_cpu)
+    if not fg_cpu.any():
+        return torch.from_numpy(forbid_cpu).to(device)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg_cpu, 8)
+    bbox_center_x = W_bb // 2
+
+    def iou(box_a, box_b):
+        ax0, ax1, ay0, ay1 = box_a
+        bx0, bx1, by0, by1 = box_b
+        ix0 = max(ax0, bx0); ix1 = min(ax1, bx1)
+        iy0 = max(ay0, by0); iy1 = min(ay1, by1)
+        if ix1 < ix0 or iy1 < iy0:
+            return 0.0
+        inter = (ix1 - ix0 + 1) * (iy1 - iy0 + 1)
+        area_a = (ax1 - ax0 + 1) * (ay1 - ay0 + 1)
+        area_b = (bx1 - bx0 + 1) * (by1 - by0 + 1)
+        return inter / (area_a + area_b - inter)
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        x_left, x_right = x, x + w - 1
+        y_top, y_bottom = y, y + h - 1
+        blob_box = (x_left, x_right, y_top, y_bottom)
+        blob_center_x = x + w / 2.0
+
+        # Find best-matching prior decision.
+        best_iou = 0.0
+        best_side = None
+        for (px0, px1, py0, py1, pside) in prior_decisions:
+            score = iou(blob_box, (px0, px1, py0, py1))
+            if score > best_iou:
+                best_iou = score
+                best_side = pside
+
+        if best_side is not None and best_iou > 0.2:
+            side = best_side
+        else:
+            # New blob with no prior match; use center heuristic.
+            side = 'R' if blob_center_x < bbox_center_x else 'L'
+
+        if side == 'L':
+            forbid_cpu[y_top:y_bottom + 1, x_left:] = 255
+        else:
+            forbid_cpu[y_top:y_bottom + 1, :x_right + 1] = 255
+
+    return torch.from_numpy(forbid_cpu).to(device)
+
+def compute_fg_forbid_mask(fg_mask_bbox_t, prev_seam_x_full, bbox_shape):
+    """
+    Convert a per-pixel FG mask into a per-pixel HARD-FORBID mask that
+    enforces "the seam never crosses any FG blob's interior."
+
+    For each connected FG blob, decide whether the seam should pass left
+    or right of it (based on the previous seam's average column at the
+    blob's rows, or the blob's relation to the bbox center on the first
+    frame). Then mark every pixel on the WRONG side of the blob (within
+    the blob's row range) as forbidden.
+
+    Args:
+        fg_mask_bbox_t: (H_bb, W_bb) uint8 GPU tensor (0 or 255).
+        prev_seam_x_full: (H_bb,) int32 numpy array, or None on first frame.
+        bbox_shape: (H_bb, W_bb) — used as a sanity check.
+
+    Returns:
+        forbid_bbox_t: (H_bb, W_bb) uint8 GPU tensor (0 or 255). 255 means
+                       "DP cost will be set to infinity here."
+        decisions: list of (x_left, x_right, y_top, y_bottom, side) tuples,
+                   one per blob. side is 'L' or 'R'. Useful for diagnostics
+                   and for the sticky-decision cache.
+    """
+    H_bb, W_bb = bbox_shape
+    device = fg_mask_bbox_t.device
+
+    # Connected components has to run on CPU.
+    fg_cpu = fg_mask_bbox_t.cpu().numpy()
+    forbid_cpu = np.zeros_like(fg_cpu)
+
+    if not fg_cpu.any():
+        return torch.from_numpy(forbid_cpu).to(device), []
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg_cpu, 8)
+    decisions = []
+
+    bbox_center_x = W_bb // 2
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        x_left, x_right = x, x + w - 1
+        y_top, y_bottom = y, y + h - 1
+        blob_center_x = x + w / 2.0
+
+        # Decide side.
+        if prev_seam_x_full is None:
+            # First frame: use blob position vs bbox center.
+            # If blob is in the LEFT half, seam goes RIGHT of it.
+            side = 'R' if blob_center_x < bbox_center_x else 'L'
+        else:
+            # Subsequent frames: average of previous seam over blob rows.
+            seam_slice = prev_seam_x_full[y_top:y_bottom + 1]
+            avg_seam = float(seam_slice.mean())
+            # If previous seam was LEFT of the blob center, side = L
+            # (seam stays left of this blob).
+            side = 'L' if avg_seam < blob_center_x else 'R'
+
+        # Mark forbidden columns within the blob's row range.
+        # Side 'L' means seam must stay left → forbid cols >= x_left
+        #   (anywhere from the blob's left edge rightward).
+        # Side 'R' means seam must stay right → forbid cols <= x_right.
+        if side == 'L':
+            forbid_cpu[y_top:y_bottom + 1, x_left:] = 255
+        else:
+            forbid_cpu[y_top:y_bottom + 1, :x_right + 1] = 255
+
+        decisions.append((int(x_left), int(x_right),
+                          int(y_top), int(y_bottom), side))
+
+    forbid_bbox_t = torch.from_numpy(forbid_cpu).to(device)
+    return forbid_bbox_t, decisions
+
 class PersonSegmenter:
     def __init__(self, weights_path: str, device: str = "cpu"):
         try:
@@ -1085,6 +1230,11 @@ def main():
     parser.add_argument("--fg_recompute_seconds", type=float, default=0.0,
                         help="Seconds between FG recomputations "
                              "(0 = startup only).")
+    parser.add_argument("--fg_recompute_decisions", action="store_true",
+                        help="When recomputing the FG mask, also refresh "
+                             "the per-blob L/R decisions from the current "
+                             "seam. Default: decisions are sticky from the "
+                             "first frame.")
     args = parser.parse_args()
 
     dev = detect_device()
@@ -1247,6 +1397,21 @@ def main():
         if use_fg and fg_recompute_frames > 0:
             print(f"[info] FG recompute every {fg_recompute_frames} frames "
                 f"(~{args.fg_recompute_seconds}s).")
+        # Hard-forbid mask derived from FG decisions. Recomputed when the FG
+        # mask is recomputed, OR (if --fg_recompute_decisions) refreshed every
+        # FG mask refresh using the current seam. Otherwise sticky.
+        fg_forbid_bbox_t = None
+        fg_decisions = []
+        if use_fg and fg_mask_bbox_t is not None:
+            fg_forbid_bbox_t, fg_decisions = compute_fg_forbid_mask(
+                fg_mask_bbox_t, prev_seam_x_full=None,
+                bbox_shape=bbox_shape,
+            )
+            sides_summary = ", ".join(
+                f"{'L' if d[4] == 'L' else 'R'}" for d in fg_decisions
+            )
+            print(f"[info] FG decisions: {len(fg_decisions)} blobs  "
+                f"sides=[{sides_summary}]")
             
     W, H = canvas_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
@@ -1290,6 +1455,27 @@ def main():
                     grid_a_t, grid_b_t, args.fg_dilate,
                     static["overlap_bbox"], overlap_in_bbox_t,
                 )
+                # Refresh forbid mask. If sticky, decisions stay the same;
+                # if --fg_recompute_decisions, refresh them from current seam.
+                seam_for_decisions = (
+                    seam_x_full if args.fg_recompute_decisions else None
+                )
+                fg_forbid_bbox_t, new_decisions = compute_fg_forbid_mask(
+                    fg_mask_bbox_t, prev_seam_x_full=seam_for_decisions,
+                    bbox_shape=bbox_shape,
+                )
+                if args.fg_recompute_decisions:
+                    fg_decisions = new_decisions
+                else:
+                    # Sticky: apply old decisions to new mask.
+                    # Rebuild forbid mask using the existing decisions.
+                    # We do this by overriding `compute_fg_forbid_mask`'s
+                    # decision logic — easiest is just to recompute with
+                    # a synthetic prev_seam that recreates the old sides.
+                    # (See note below.)
+                    fg_forbid_bbox_t = _apply_sticky_decisions(
+                        fg_mask_bbox_t, fg_decisions, bbox_shape,
+                    )
             if dev["cuda_available"]:
                 warped_a_t = warp_gpu(frame_a, grid_a_t, gpu_ctx["device"],
                                       gain_t=gain_a_t)
@@ -1356,6 +1542,7 @@ def main():
                     person_mask_bbox_t if has_person else None,
                     fg_mask_bbox_t if use_fg else None,
                     args.fg_penalty,
+                    fg_forbid_bbox_t if use_fg else None,
                     static["overlap_bbox"],
                 )
                 cost_for_dp = cost_for_dp_np

@@ -10,3 +10,4 @@ test
 *.npy
 /__pycache__/
 *.pt
+*.png
