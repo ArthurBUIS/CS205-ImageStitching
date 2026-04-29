@@ -450,7 +450,16 @@ def dilate_gpu(mask_u8_t, radius):
 
 def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
                              cost_ema_t, ema_alpha, person_mask_bbox_t,
+                             fg_mask_bbox_t, fg_penalty,
                              overlap_bbox):
+    """
+    GPU cost + EMA + penalty injection.
+
+    Penalty hierarchy (additive on cost_ema):
+        photometric (0 - 1e5)
+        + fg_penalty (default 5e7) where fg_mask AND NOT person_mask
+        + PERSON_PENALTY (1e8) where person_mask
+    """
     x0, y0, x1, y1 = overlap_bbox
     wa_bb = warped_a_t[0, :, y0:y1, x0:x1].float()
     wb_bb = warped_b_t[0, :, y0:y1, x0:x1].float()
@@ -472,6 +481,18 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
             cost_ema_t = ema_alpha * photo_cost + (1.0 - ema_alpha) * cost_ema_t
 
     cost_for_dp = cost_ema_t.clone()
+
+    # FG penalty first (lower priority), person second (higher).
+    # A pixel that's both gets the sum, but person (1e8) >> fg (5e7) so
+    # the effect is the same as taking the max.
+    if fg_mask_bbox_t is not None:
+        if person_mask_bbox_t is not None:
+            fg_only = fg_mask_bbox_t & (~person_mask_bbox_t)
+        else:
+            fg_only = fg_mask_bbox_t
+        cost_for_dp = torch.where(fg_only > 0,
+                                  cost_for_dp + fg_penalty,
+                                  cost_for_dp)
     if person_mask_bbox_t is not None:
         cost_for_dp = torch.where(person_mask_bbox_t > 0,
                                   cost_for_dp + PERSON_PENALTY,
@@ -853,6 +874,43 @@ def seam_to_hardcut_masks(seam_x_full, static, bbox_shape,
 # YOLO
 # ---------------------------------------------------------------------------
 
+# Default COCO classes for static foreground: furniture and large electronics.
+# 56=chair, 57=couch, 59=bed, 60=dining table, 62=tv, 63=laptop, 73=book.
+DEFAULT_FG_CLASS_IDS = [56, 57, 59, 60, 62, 63, 73]
+
+
+def compute_fg_mask_seg_gpu(segmenter, frame_a, frame_b, class_ids,
+                             grid_a_t, grid_b_t, dilate_radius,
+                             overlap_bbox, overlap_in_bbox_t):
+    """
+    Static foreground mask via instance segmentation (YOLO).
+    Runs the segmenter on each ORIGINAL frame asking for `class_ids`,
+    warps each mask to the canvas via grid_sample, unions, dilates,
+    and crops to the overlap bbox.
+
+    Returns a (H_bb, W_bb) uint8 tensor on GPU (0 or 255).
+    """
+    H_a, W_a = frame_a.shape[:2]
+    H_b, W_b = frame_b.shape[:2]
+
+    mask_a_src_t = segmenter.predict_classes_mask_gpu(frame_a, (H_a, W_a), class_ids)
+    mask_b_src_t = segmenter.predict_classes_mask_gpu(frame_b, (H_b, W_b), class_ids)
+
+    mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
+    mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
+
+    union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
+    union_t = dilate_gpu(union_t, dilate_radius)
+
+    x0, y0, x1, y1 = overlap_bbox
+    fg_mask_bbox_t = union_t[y0:y1, x0:x1].contiguous()
+    # AND with overlap shape inside bbox (from passed overlap_in_bbox_t,
+    # which is the bbox-sized version).
+    fg_mask_bbox_t = torch.where(overlap_in_bbox_t > 0,
+                                 fg_mask_bbox_t,
+                                 torch.zeros_like(fg_mask_bbox_t))
+    return fg_mask_bbox_t
+
 class PersonSegmenter:
     def __init__(self, weights_path: str, device: str = "cpu"):
         try:
@@ -888,6 +946,32 @@ class PersonSegmenter:
         H_tgt, W_tgt = target_hw
         results = self.model.predict(
             frame_bgr, classes=[PERSON_CLASS_ID],
+            verbose=False, retina_masks=False,
+            device=self.device,
+        )
+        if not results:
+            return torch.zeros((H_tgt, W_tgt), dtype=torch.uint8,
+                               device=self.device)
+        r = results[0]
+        if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
+            return torch.zeros((H_tgt, W_tgt), dtype=torch.uint8,
+                               device=self.device)
+        mdata = r.masks.data
+        merged = (mdata > 0.5).any(dim=0).float()
+        m = merged.unsqueeze(0).unsqueeze(0)
+        m = F.interpolate(m, size=(H_tgt, W_tgt), mode="nearest")
+        mask = (m[0, 0] * 255).to(torch.uint8)
+        return mask
+
+    def predict_classes_mask_gpu(self, frame_bgr, target_hw, class_ids):
+        """
+        Like predict_mask_gpu, but for an arbitrary list of COCO class IDs.
+        Returns a (H, W) uint8 tensor on GPU with the union of all detected
+        instances of any class in `class_ids`.
+        """
+        H_tgt, W_tgt = target_hw
+        results = self.model.predict(
+            frame_bgr, classes=list(class_ids),
             verbose=False, retina_masks=False,
             device=self.device,
         )
@@ -986,6 +1070,21 @@ def main():
     parser.add_argument("--feather_px", type=int, default=8)
     parser.add_argument("--seam_lambda", type=float, default=5.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
+    # Static foreground (segmentation-based) flags.
+    parser.add_argument("--no_fg", action="store_true",
+                        help="Disable static foreground detection.")
+    parser.add_argument("--fg_classes", type=int, nargs="+",
+                        default=DEFAULT_FG_CLASS_IDS,
+                        help="COCO class IDs for static foreground "
+                             "(default: chair, couch, bed, table, tv, "
+                             "laptop, book).")
+    parser.add_argument("--fg_dilate", type=int, default=10,
+                        help="FG mask dilation radius in px (default 10).")
+    parser.add_argument("--fg_penalty", type=float, default=5e7,
+                        help="Cost penalty for FG pixels (default 5e7).")
+    parser.add_argument("--fg_recompute_seconds", type=float, default=0.0,
+                        help="Seconds between FG recomputations "
+                             "(0 = startup only).")
     args = parser.parse_args()
 
     dev = detect_device()
@@ -1123,7 +1222,32 @@ def main():
         grid_b_t = build_grid_sample_tensor(map_bx, map_by, frame_b.shape, torch_device)
         overlap_in_bbox_t = torch.from_numpy(static["overlap_in_bbox"]).to(torch_device)
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
+        # --- Static foreground mask (segmentation-based) -------------------
+        use_fg = not args.no_fg and dev["cuda_available"]
+        fg_mask_bbox_t = None
+        if use_fg:
+            print(f"[info] Computing static FG mask via YOLO segmentation. "
+                f"Classes: {args.fg_classes}")
+            t0 = time.time()
+            fg_mask_bbox_t = compute_fg_mask_seg_gpu(
+                segmenter, frame_a, frame_b, args.fg_classes,
+                grid_a_t, grid_b_t, args.fg_dilate,
+                static["overlap_bbox"], overlap_in_bbox_t,
+            )
+            coverage = (fg_mask_bbox_t > 0).float().mean().item() * 100
+            print(f"[info] FG mask computed in {(time.time()-t0)*1000:.1f} ms  "
+                f"({coverage:.1f}% of bbox flagged).")
+        elif not dev["cuda_available"]:
+            print("[info] FG detection disabled (CPU mode not implemented for seg).")
 
+        fg_recompute_frames = (
+            int(round(args.fg_recompute_seconds * sync_reader.output_fps))
+            if args.fg_recompute_seconds > 0 else 0
+        )
+        if use_fg and fg_recompute_frames > 0:
+            print(f"[info] FG recompute every {fg_recompute_frames} frames "
+                f"(~{args.fg_recompute_seconds}s).")
+            
     W, H = canvas_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
     take_from_a  = np.zeros((H, W), dtype=np.uint8)
@@ -1158,7 +1282,14 @@ def main():
                 if not ok:
                     break
             t1 = time.perf_counter()
-
+            # Periodic FG recompute.
+            if (use_fg and fg_recompute_frames > 0 and frame_idx > 0
+                    and frame_idx % fg_recompute_frames == 0):
+                fg_mask_bbox_t = compute_fg_mask_seg_gpu(
+                    segmenter, frame_a, frame_b, args.fg_classes,
+                    grid_a_t, grid_b_t, args.fg_dilate,
+                    static["overlap_bbox"], overlap_in_bbox_t,
+                )
             if dev["cuda_available"]:
                 warped_a_t = warp_gpu(frame_a, grid_a_t, gpu_ctx["device"],
                                       gain_t=gain_a_t)
@@ -1223,6 +1354,8 @@ def main():
                     warped_a_t, warped_b_t, static_t,
                     cost_ema_t, ema_eff,
                     person_mask_bbox_t if has_person else None,
+                    fg_mask_bbox_t if use_fg else None,
+                    args.fg_penalty,
                     static["overlap_bbox"],
                 )
                 cost_for_dp = cost_for_dp_np
@@ -1294,6 +1427,11 @@ def main():
                     static["overlap_in_bbox"], args.feather_px, out_buf,
                 )
             if args.debug_mask:
+                # Layer FG (yellow, bottom) under person (red, top).
+                if use_fg and fg_mask_bbox_t is not None:
+                    fg_cpu = fg_mask_bbox_t.cpu().numpy()
+                    draw_mask_overlay(stitched, fg_cpu, static["overlap_bbox"],
+                                      color=(0, 255, 255), alpha=0.25)
                 draw_mask_overlay(stitched, person_mask_bbox, static["overlap_bbox"])
             if args.debug_seam:
                 draw_seam_overlay(stitched, seam_x_full, static["overlap_bbox"])
