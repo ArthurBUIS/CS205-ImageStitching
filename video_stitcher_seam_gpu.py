@@ -1292,6 +1292,9 @@ def main():
     parser.add_argument("--feather_px", type=int, default=8)
     parser.add_argument("--seam_lambda", type=float, default=5.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
+    parser.add_argument("--crop_right", type=int, default=0,
+                        help="Crop X columns of pixels from the left side of "
+                             "the right image to reduce the overlapping area.")
     # Background-only homography options.
     parser.add_argument("--bg_homography_method",
                         choices=["none", "yolo", "depth"],
@@ -1396,6 +1399,17 @@ def main():
     if not ok:
         raise RuntimeError("Could not read first frame pair.")
 
+    # Preserve an uncropped copy in case cropping produces a degenerate
+    # homography/canvas and we need to fall back.
+    frame_b_full = frame_b.copy()
+
+    # Apply cropping to right image BEFORE homography estimation if
+    # requested by the user. This reduces the overlap used for ORB.
+    if args.crop_right > 0:
+        if args.crop_right >= frame_b.shape[1]:
+            raise RuntimeError("--crop_right must be smaller than right image width")
+        frame_b = frame_b[:, args.crop_right:, :]
+
     if ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME:
         print("[info] Estimating homography from first frame pair...")
         bg_mask_a = bg_mask_b = None
@@ -1439,6 +1453,7 @@ def main():
             del tmp_depth  # release model memory
         H_b_to_a = estimate_homography(frame_a, frame_b,
                                        mask_a=bg_mask_a, mask_b=bg_mask_b)
+        # Compute canvas using the (possibly) cropped right frame.
         np.save(HOMOGRAPHY_PATH, H_b_to_a)
     else:
         if not Path(HOMOGRAPHY_PATH).exists():
@@ -1448,6 +1463,24 @@ def main():
     canvas_size, T, H_b_to_canvas, H_a_to_canvas = compute_canvas(
         frame_a.shape, frame_b.shape, H_b_to_a
     )
+    canvas_w, canvas_h = canvas_size
+    # Defensive check: if the canvas is unreasonably large (symptom of a
+    # degenerate homography caused by aggressive cropping), fall back to
+    # using the uncropped right frame for homography estimation.
+    max_dim = 20000
+    max_area = int(1e8)  # ~100 million pixels
+    if canvas_w > max_dim or canvas_h > max_dim or (canvas_w * canvas_h) > max_area:
+        print(f"[warning] Canvas too large ({canvas_w}x{canvas_h}); "
+              "recomputing homography using uncropped right frame...")
+        # Recompute homography with uncropped right image
+        frame_b = frame_b_full
+        if ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME:
+            H_b_to_a = estimate_homography(frame_a, frame_b,
+                                           mask_a=bg_mask_a, mask_b=bg_mask_b)
+            np.save(HOMOGRAPHY_PATH, H_b_to_a)
+        canvas_size, T, H_b_to_canvas, H_a_to_canvas = compute_canvas(
+            frame_a.shape, frame_b.shape, H_b_to_a
+        )
     print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
 
     print("[info] Precomputing remap maps + static geometry...")
@@ -1489,6 +1522,9 @@ def main():
         cv2.MORPH_ELLIPSE,
         (2 * args.mask_dilate + 1, 2 * args.mask_dilate + 1),
     )
+
+    # Ensure `use_fg` is always defined even if CUDA is unavailable.
+    use_fg = not args.no_fg and dev["cuda_available"]
 
     gpu_ctx = None
     grid_a_t = None
@@ -1586,6 +1622,9 @@ def main():
                 ok, frame_a, frame_b = sync_reader.read()
                 if not ok:
                     break
+            # Apply cropping to right image if requested.
+            if args.crop_right > 0:
+                frame_b = frame_b[:, args.crop_right:, :]
             t1 = time.perf_counter()
             # Periodic FG recompute.
             if (use_fg and fg_recompute_frames > 0 and frame_idx > 0
