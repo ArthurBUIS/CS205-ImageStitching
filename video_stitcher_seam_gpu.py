@@ -265,12 +265,49 @@ def detect_device():
 # Homography + canvas + static geometry (unchanged)
 # ---------------------------------------------------------------------------
 
-def estimate_homography(img_a, img_b):
+def build_fg_mask_for_orb_yolo(frame_bgr, segmenter, class_ids, dilate_radius):
+    """
+    Returns a uint8 mask (H, W) where pixels are 0 in foreground (forbidden
+    for ORB) and 255 elsewhere (valid for ORB).
+
+    Uses YOLO segmentation directly on the original frame.
+    """
+    H, W = frame_bgr.shape[:2]
+    mask_t = segmenter.predict_classes_mask_gpu(frame_bgr, (H, W), class_ids)
+    fg_cpu = mask_t.cpu().numpy()
+    if dilate_radius > 0:
+        k = 2 * dilate_radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        fg_cpu = cv2.dilate(fg_cpu, kernel)
+    # Invert: ORB-valid where foreground is absent.
+    return cv2.bitwise_not(fg_cpu)
+
+
+def build_fg_mask_for_orb_depth(frame_bgr, depth_estimator, percentile,
+                                 dilate_radius):
+    """
+    Returns a uint8 mask (H, W) where pixels are 0 in foreground (forbidden
+    for ORB) and 255 elsewhere (valid for ORB).
+
+    Uses monocular depth: the closest `percentile` % of pixels are
+    flagged as foreground.
+    """
+    depth = depth_estimator.predict_depth(frame_bgr)
+    threshold = np.percentile(depth, 100.0 - percentile)
+    fg_bool = depth >= threshold
+    fg_u8 = (fg_bool.astype(np.uint8)) * 255
+    if dilate_radius > 0:
+        k = 2 * dilate_radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        fg_u8 = cv2.dilate(fg_u8, kernel)
+    return cv2.bitwise_not(fg_u8)
+
+def estimate_homography(img_a, img_b, mask_a=None, mask_b=None):
     gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
     gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
     orb = cv2.ORB_create(nfeatures=4000)
-    kpts_a, desc_a = orb.detectAndCompute(gray_a, None)
-    kpts_b, desc_b = orb.detectAndCompute(gray_b, None)
+    kpts_a, desc_a = orb.detectAndCompute(gray_a, mask_a)
+    kpts_b, desc_b = orb.detectAndCompute(gray_b, mask_b)
     if desc_a is None or desc_b is None:
         raise RuntimeError("Could not detect ORB features.")
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
@@ -1056,6 +1093,46 @@ def compute_fg_forbid_mask(fg_mask_bbox_t, prev_seam_x_full, bbox_shape):
     forbid_bbox_t = torch.from_numpy(forbid_cpu).to(device)
     return forbid_bbox_t, decisions
 
+class MonocularDepthEstimator:
+    """
+    Wraps Depth Anything v2 from HuggingFace transformers. Returns a
+    relative depth map per frame (higher = closer).
+    """
+    def __init__(self, model_name: str, device: str = "cpu"):
+        try:
+            from transformers import pipeline
+        except ImportError as e:
+            raise RuntimeError(
+                "pip install transformers pillow"
+            ) from e
+        from PIL import Image  # noqa: F401
+
+        self.model_name = model_name
+        self.device = device
+        pipeline_device = 0 if device == "cuda" else -1
+        print(f"[depth] Loading {model_name} on {device}...")
+        self.pipe = pipeline(
+            task="depth-estimation",
+            model=model_name,
+            device=pipeline_device,
+        )
+        print(f"[depth] Loaded.")
+
+    def predict_depth(self, frame_bgr):
+        from PIL import Image
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        out = self.pipe(pil)
+        d = out["predicted_depth"]
+        if isinstance(d, torch.Tensor):
+            d = d.detach().float().cpu().numpy()
+        if d.ndim == 3:
+            d = d[0]
+        H_in, W_in = frame_bgr.shape[:2]
+        if d.shape != (H_in, W_in):
+            d = cv2.resize(d, (W_in, H_in), interpolation=cv2.INTER_LINEAR)
+        return d.astype(np.float32)
+
 class PersonSegmenter:
     def __init__(self, weights_path: str, device: str = "cpu"):
         try:
@@ -1215,6 +1292,29 @@ def main():
     parser.add_argument("--feather_px", type=int, default=8)
     parser.add_argument("--seam_lambda", type=float, default=5.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
+    # Background-only homography options.
+    parser.add_argument("--bg_homography_method",
+                        choices=["none", "yolo", "depth"],
+                        default="none",
+                        help="If set, mask out foreground when computing "
+                             "the homography. yolo: use YOLO segmentation "
+                             "of furniture classes. depth: use monocular "
+                             "depth + percentile threshold. none (default): "
+                             "use all features.")
+    parser.add_argument("--bg_yolo_classes", type=int, nargs="+",
+                        default=DEFAULT_FG_CLASS_IDS,
+                        help="When bg_homography_method=yolo, which COCO "
+                             "classes count as foreground. Default: same "
+                             "list as --fg_classes.")
+    parser.add_argument("--bg_depth_model",
+                        default="depth-anything/Depth-Anything-V2-Small-hf",
+                        help="HF model id for bg_homography_method=depth.")
+    parser.add_argument("--bg_depth_percentile", type=float, default=30.0,
+                        help="When bg_homography_method=depth, closest N%% "
+                             "of pixels are excluded from ORB.")
+    parser.add_argument("--bg_dilate", type=int, default=15,
+                        help="Dilation of the foreground mask before ORB "
+                             "(default 15).")
     # Static foreground (segmentation-based) flags.
     parser.add_argument("--no_fg", action="store_true",
                         help="Disable static foreground detection.")
@@ -1298,7 +1398,47 @@ def main():
 
     if ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME:
         print("[info] Estimating homography from first frame pair...")
-        H_b_to_a = estimate_homography(frame_a, frame_b)
+        bg_mask_a = bg_mask_b = None
+        if args.bg_homography_method == "yolo":
+            print(f"[info] Building bg masks via YOLO "
+                  f"(classes={args.bg_yolo_classes}, "
+                  f"dilate={args.bg_dilate})...")
+            # Need a segmenter just for this. Reuse the same model as the
+            # main YOLO. The main `segmenter` object is created later in
+            # main(), so we instantiate one here too.
+            yolo_device = "cuda" if dev["cuda_available"] else "cpu"
+            tmp_segmenter = PersonSegmenter(args.yolo_weights,
+                                            device=yolo_device)
+            bg_mask_a = build_fg_mask_for_orb_yolo(
+                frame_a, tmp_segmenter, args.bg_yolo_classes, args.bg_dilate,
+            )
+            bg_mask_b = build_fg_mask_for_orb_yolo(
+                frame_b, tmp_segmenter, args.bg_yolo_classes, args.bg_dilate,
+            )
+            valid_a = 100 * (bg_mask_a > 0).sum() / bg_mask_a.size
+            valid_b = 100 * (bg_mask_b > 0).sum() / bg_mask_b.size
+            print(f"[info] BG mask coverage: A={valid_a:.1f}%, "
+                  f"B={valid_b:.1f}% of frame.")
+        elif args.bg_homography_method == "depth":
+            print(f"[info] Building bg masks via depth model "
+                  f"(percentile={args.bg_depth_percentile}, "
+                  f"dilate={args.bg_dilate})...")
+            depth_device = "cuda" if dev["cuda_available"] else "cpu"
+            tmp_depth = MonocularDepthEstimator(args.bg_depth_model,
+                                                device=depth_device)
+            bg_mask_a = build_fg_mask_for_orb_depth(
+                frame_a, tmp_depth, args.bg_depth_percentile, args.bg_dilate,
+            )
+            bg_mask_b = build_fg_mask_for_orb_depth(
+                frame_b, tmp_depth, args.bg_depth_percentile, args.bg_dilate,
+            )
+            valid_a = 100 * (bg_mask_a > 0).sum() / bg_mask_a.size
+            valid_b = 100 * (bg_mask_b > 0).sum() / bg_mask_b.size
+            print(f"[info] BG mask coverage: A={valid_a:.1f}%, "
+                  f"B={valid_b:.1f}% of frame.")
+            del tmp_depth  # release model memory
+        H_b_to_a = estimate_homography(frame_a, frame_b,
+                                       mask_a=bg_mask_a, mask_b=bg_mask_b)
         np.save(HOMOGRAPHY_PATH, H_b_to_a)
     else:
         if not Path(HOMOGRAPHY_PATH).exists():
