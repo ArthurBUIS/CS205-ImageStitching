@@ -11,3 +11,5 @@ test
 /__pycache__/
 *.pt
 *.png
+*.npz
+*.json
