@@ -1,46 +1,162 @@
 """
-Real-time video stitching from two fixed cameras — v5: FPS desync handling.
+Real-time video stitching from two fixed cameras (GPU pipeline + CPU fallback).
 
-Same as v4, with one structural change: the two input videos are no
-longer assumed to have identical frame rates. A new FrameSyncReader
-pairs each output frame with the temporally-nearest frame from each
-camera, dropping frames from the faster stream as needed.
+Stitches two video streams from physically-fixed cameras into a single
+panorama, with seam placement aware of moving people (YOLO person mask)
+and static foreground objects (YOLO class segmentation: chairs, couches,
+desks, etc.) so the seam never crosses through them. Multi-band Laplacian
+blending makes the seam invisible on the background.
 
-Why this matters
-----------------
-If camera A records at 26.43 fps and camera B at 25.37 fps, then after
-N frames their timestamps diverge by N * (1/25.37 - 1/26.43) seconds.
-At N=600 (~24 seconds at the slower rate), the divergence is roughly
-1 second. cv2.VideoCapture.read() doesn't know about timestamps, so
-naive lockstep reading produces frame pairs that represent different
-real-world moments — visible as e.g. two YOLO masks for the same person
-appearing at different positions in the stitched output.
+Runs end-to-end on GPU (PyTorch grid_sample, conv2d, max_pool2d) when
+CUDA is available; transparently falls back to a pure OpenCV/numpy
+implementation when it isn't.
 
-How FrameSyncReader works
--------------------------
-At startup it reads each video's nominal FPS via CAP_PROP_FPS. The
-slower stream is designated the "driver" — its frames are output
-verbatim, one per pipeline iteration. The faster stream is the
-"follower"; for each driver frame at timestamp t, the reader
-advances through the follower until it lands on the frame whose
-timestamp is closest to t.
+Pipeline
+--------
+Startup (runs once, on the first paired frame):
+    1. Estimate a single homography (ORB + RANSAC).
+    2. Compute the panorama canvas size, build pixel-level remap tables
+       (or grid_sample tensors on GPU), and pre-build static geometry:
+       per-camera validity masks, the overlap region, its bbox.
+    3. (Optional) Per-channel BGR gain compensation from frame 0.
+    4. (Optional) Compute a static foreground mask via YOLO segmentation
+       on a configurable list of COCO classes — warped, unioned, dilated.
+    5. (Optional) Compute an autocrop rectangle from the homography.
 
-If the FPS values match within DESYNC_TOLERANCE (default 0.5%), the
-reader degrades to identical-lockstep behavior — no frames dropped,
-no overhead.
+Per frame:
+    1. FrameSyncReader pulls a paired frame, dropping frames from the
+       faster stream when the two input FPS values differ.
+    2. Warp both frames to the canvas (gain folded in on GPU).
+    3. Run YOLO every N frames; warp + dilate the union → "person mask".
+    4. Photometric cost (squared BGR diff) over the overlap bbox; smoothed
+       across frames via EMA.
+    5. Inject penalties: forbid edges, fg-mask, person-mask. Add a
+       quadratic attractor toward the previous frame's seam.
+    6. Find the minimum-cost seam by dynamic programming on a downscaled
+       cost map.
+    7. Build a soft mask from the seam and run multi-band Laplacian
+       pyramid blending on the overlap bbox; hard-copy the rest.
+    8. (Optional) Crop to the autocrop rectangle.
+    9. Write the frame.
 
-Output FPS = the slower input FPS. We never duplicate frames; we
-only drop them. That's the cleaner direction (no stutter) and
-matches what the user asked for.
+FPS desync (FrameSyncReader)
+----------------------------
+If the two input FPS values differ by more than 0.5%, the slower stream
+becomes the "driver" (one frame per pipeline tick) and the faster stream
+becomes the "follower" (advance to the closest-in-time frame, drop the
+rest). Output FPS = slower input FPS. No frame is ever duplicated. If
+the FPS values match within tolerance, this is a zero-overhead lockstep
+read. This corrects nominal-rate mismatch but not intra-stream jitter
+or wall-clock drift unrelated to FPS declarations.
 
-Limits of this approach
------------------------
-This corrects nominal-rate mismatch (the dominant cause of multi-cam
-desync). It cannot correct intra-stream jitter (frames arriving
-non-uniformly within a stream) or wall-clock drift unrelated to FPS
-declarations. For those, audio cross-correlation or hardware sync
-would be needed. For typical webcam-class recordings with declared
-but mismatched FPS, this is sufficient.
+Command-line arguments
+----------------------
+Required:
+    --video_a PATH              Input video from camera A (left).
+    --video_b PATH              Input video from camera B (right).
+    --output PATH               Output stitched video (.mp4).
+
+General:
+    --max_frames N              Process only the first N frames (0 = all).
+                                Useful for quick iteration. Default: 0.
+    --debug_seam                Overlay the DP seam as a red line on the
+                                output.
+    --debug_mask                Overlay the person mask (red) and the
+                                static FG mask (yellow) as translucent
+                                overlays on the output.
+    --autocrop                  Crop the output to a clean axis-aligned
+                                rectangle. The right edge is set by the
+                                more-conservative (smaller-x) of B's two
+                                warped right corners; the left edge is
+                                A's left edge on canvas; vertical extent
+                                spans both right corners. Saves disk
+                                space and removes the polygonal black
+                                borders of the raw stitched canvas.
+
+Person segmentation (YOLOv8n-seg):
+    --yolo_weights PATH         Path/name of YOLO weights file. Default:
+                                yolov8n-seg.pt (auto-downloaded on first
+                                run, ~7 MB).
+    --yolo_every N              Run YOLO once every N frames; reuse the
+                                cached mask in between. Lower = fresher
+                                mask but slower. Higher = staler but
+                                faster. Default: 3.
+    --mask_dilate PX            Dilation radius applied to the unioned
+                                person mask, in pixels. Absorbs the
+                                parallax offset between A and B's view of
+                                the same person. Increase if the seam
+                                grazes a person's outline; decrease if
+                                the mask engulfs background. Default: 15.
+
+Static foreground (segmentation-based):
+    --no_fg                     Disable static FG detection entirely.
+    --fg_classes CLASS_IDS ...  Space-separated COCO class IDs to treat
+                                as static foreground. Default: 56 57 59
+                                60 62 63 73 (chair, couch, bed, dining
+                                table, tv, laptop, book).
+    --fg_dilate PX              Dilation radius for the FG mask, in
+                                pixels. Default: 10.
+    --fg_penalty F              Cost penalty added to FG pixels (and
+                                NOT-person — person wins where they
+                                overlap). Default: 5e7.
+    --fg_recompute_seconds F    Seconds between FG mask recomputations.
+                                0 = compute once at startup and never
+                                again. Increase if the scene has
+                                furniture that gets rearranged during
+                                the recording. Default: 0.
+
+Cost-map behavior:
+    --cost_ema A                EMA factor in [0, 1] for the photometric
+                                cost. Lower = smoother but slower to
+                                react. Higher = more reactive but
+                                jitterier. Default: 0.4.
+    --no_cost_ema               Disable EMA entirely (equivalent to
+                                cost_ema = 1.0).
+    --seam_lambda F             Strength of the quadratic "stay near the
+                                previous seam" attractor. 0 disables it.
+                                Higher pins the seam harder; too high
+                                and the seam reacts sluggishly when a
+                                person approaches. Default: 5.0.
+    --seam_edge_margin N        Width in pixels of the forbidden band at
+                                the left/right edges of the overlap
+                                bbox. Should be at least blend_width / 2
+                                so the multi-band blur doesn't reach
+                                into padded pixels. 0 disables.
+                                Default: 50.
+
+Seam computation:
+    --seam_downscale N          Factor by which the cost map is
+                                downscaled before DP. Higher = much
+                                faster DP, but coarser seam. Default: 4.
+
+Gain compensation:
+    --no_gain_comp              Disable global per-channel gain
+                                compensation. With multi-band blending
+                                on, gain comp is partially redundant —
+                                the coarsest pyramid band already
+                                handles low-frequency exposure
+                                matching — but disabling it can leave a
+                                faint colour step depending on the
+                                cameras.
+
+Multi-band blending:
+    --blend_width PX            Width in pixels of the soft mask ramp
+                                around the DP seam. Default: 80.
+                                Constraint: seam_edge_margin >=
+                                blend_width / 2.
+    --blend_levels N            Laplacian pyramid depth. Higher = wider
+                                low-frequency blending (better exposure
+                                hiding) at the cost of more pyrDown /
+                                pyrUp per frame. Default: 5.
+
+Usage
+-----
+    python video_stitcher_seam_gpu.py \\
+        --video_a camA.mp4 --video_b camB.mp4 --output stitched.mp4
+
+For a first run on a new scene, add --debug_seam --debug_mask --autocrop
+and reduce --max_frames to inspect the seam, the masks, and the crop
+rectangle quickly.
 """
 
 import argparse
@@ -898,6 +1014,26 @@ def compute_fg_mask_seg_gpu(segmenter, frame_a, frame_b, class_ids,
                                  torch.zeros_like(fg_mask_bbox_t))
     return fg_mask_bbox_t
 
+def compute_fg_mask_seg_cpu(segmenter, frame_a, frame_b, class_ids,
+                             map_ax, map_ay, map_bx, map_by,
+                             fg_dilate_kernel, overlap_bbox, overlap_in_bbox):
+    """
+    CPU variant of compute_fg_mask_seg_gpu. Returns a (H_bb, W_bb) uint8
+    numpy mask (0 or 255), cropped to the overlap bbox and AND'd with
+    the overlap shape.
+    """
+    mask_a_src = segmenter.predict_classes_mask(frame_a, class_ids)
+    mask_b_src = segmenter.predict_classes_mask(frame_b, class_ids)
+    mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
+    mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
+    union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
+    if fg_dilate_kernel is not None:
+        union = cv2.dilate(union, fg_dilate_kernel)
+    x0, y0, x1, y1 = overlap_bbox
+    fg_bbox = union[y0:y1, x0:x1].copy()
+    return cv2.bitwise_and(fg_bbox, overlap_in_bbox)
+
+
 class PersonSegmenter:
     def __init__(self, weights_path: str, device: str = "cpu"):
         try:
@@ -911,10 +1047,15 @@ class PersonSegmenter:
         except Exception as e:
             print(f"[yolo] Could not move model to {device}: {e}.")
 
-    def predict_mask(self, frame_bgr):
+    def predict_classes_mask(self, frame_bgr, class_ids=(PERSON_CLASS_ID,)):
+        """
+        CPU/numpy variant of predict_classes_mask_gpu. Returns a (H, W)
+        uint8 numpy mask (0 or 255) with the union of all detected
+        instances of any class in `class_ids`.
+        """
         H, W = frame_bgr.shape[:2]
         results = self.model.predict(
-            frame_bgr, classes=[PERSON_CLASS_ID],
+            frame_bgr, classes=list(class_ids),
             verbose=False, retina_masks=False,
             device=self.device,
         )
@@ -926,8 +1067,7 @@ class PersonSegmenter:
             return mask
         mdata = r.masks.data.cpu().numpy()
         merged_small = (mdata > 0.5).any(axis=0).astype(np.uint8) * 255
-        mask = cv2.resize(merged_small, (W, H), interpolation=cv2.INTER_NEAREST)
-        return mask
+        return cv2.resize(merged_small, (W, H), interpolation=cv2.INTER_NEAREST)
 
     def predict_classes_mask_gpu(self, frame_bgr, target_hw,
                                  class_ids=(PERSON_CLASS_ID,)):
@@ -1187,16 +1327,18 @@ def main():
         cv2.MORPH_ELLIPSE,
         (2 * args.mask_dilate + 1, 2 * args.mask_dilate + 1),
     )
+    fg_dilate_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * args.fg_dilate + 1, 2 * args.fg_dilate + 1),
+        ) if args.fg_dilate > 0 else None
+    )
 
     gpu_ctx = None
     grid_a_t = None
     grid_b_t = None
     overlap_in_bbox_t = None
     cost_ema_t = None
-    # Defaults for foreground (FG) variables when running on CPU
-    use_fg = False
-    fg_mask_bbox_t = None
-    fg_recompute_frames = 0
     if dev["cuda_available"]:
         torch_device = torch.device("cuda")
         valid_in_bbox_np = cv2.bitwise_or(static["mask_a_in_bbox"],
@@ -1214,32 +1356,41 @@ def main():
         grid_b_t = build_grid_sample_tensor(map_bx, map_by, frame_b.shape, torch_device)
         overlap_in_bbox_t = torch.from_numpy(static["overlap_in_bbox"]).to(torch_device)
         print("[device] GPU contexts (gain + warp + mask + cost + composite) initialized.")
-        # --- Static foreground mask (segmentation-based) -------------------
-        use_fg = not args.no_fg and dev["cuda_available"]
-        fg_mask_bbox_t = None
-        if use_fg:
-            print(f"[info] Computing static FG mask via YOLO segmentation. "
-                f"Classes: {args.fg_classes}")
-            t0 = time.time()
+
+    # --- Static foreground mask (segmentation-based) -----------------------
+    use_fg = not args.no_fg
+    fg_mask_bbox_t = None  # GPU path
+    fg_mask_bbox = None    # CPU path
+    if use_fg:
+        print(f"[info] Computing static FG mask via YOLO segmentation. "
+              f"Classes: {args.fg_classes}")
+        t0 = time.time()
+        if dev["cuda_available"]:
             fg_mask_bbox_t = compute_fg_mask_seg_gpu(
                 segmenter, frame_a, frame_b, args.fg_classes,
                 grid_a_t, grid_b_t, args.fg_dilate,
                 static["overlap_bbox"], overlap_in_bbox_t,
             )
             coverage = (fg_mask_bbox_t > 0).float().mean().item() * 100
-            print(f"[info] FG mask computed in {(time.time()-t0)*1000:.1f} ms  "
-                f"({coverage:.1f}% of bbox flagged).")
-        elif not dev["cuda_available"]:
-            print("[info] FG detection disabled (CPU mode not implemented for seg).")
+        else:
+            fg_mask_bbox = compute_fg_mask_seg_cpu(
+                segmenter, frame_a, frame_b, args.fg_classes,
+                map_ax, map_ay, map_bx, map_by,
+                fg_dilate_kernel,
+                static["overlap_bbox"], static["overlap_in_bbox"],
+            )
+            coverage = float((fg_mask_bbox > 0).mean()) * 100
+        print(f"[info] FG mask computed in {(time.time()-t0)*1000:.1f} ms  "
+              f"({coverage:.1f}% of bbox flagged).")
 
-        fg_recompute_frames = (
-            int(round(args.fg_recompute_seconds * sync_reader.output_fps))
-            if args.fg_recompute_seconds > 0 else 0
-        )
-        if use_fg and fg_recompute_frames > 0:
-            print(f"[info] FG recompute every {fg_recompute_frames} frames "
-                f"(~{args.fg_recompute_seconds}s).")
-            
+    fg_recompute_frames = (
+        int(round(args.fg_recompute_seconds * sync_reader.output_fps))
+        if args.fg_recompute_seconds > 0 else 0
+    )
+    if use_fg and fg_recompute_frames > 0:
+        print(f"[info] FG recompute every {fg_recompute_frames} frames "
+              f"(~{args.fg_recompute_seconds}s).")
+
     W, H = canvas_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
     cost_scratch = np.empty((bbox_shape[0], bbox_shape[1], 3), dtype=np.float32)
@@ -1282,11 +1433,19 @@ def main():
             # Periodic FG recompute.
             if (use_fg and fg_recompute_frames > 0 and frame_idx > 0
                     and frame_idx % fg_recompute_frames == 0):
-                fg_mask_bbox_t = compute_fg_mask_seg_gpu(
-                    segmenter, frame_a, frame_b, args.fg_classes,
-                    grid_a_t, grid_b_t, args.fg_dilate,
-                    static["overlap_bbox"], overlap_in_bbox_t,
-                )
+                if dev["cuda_available"]:
+                    fg_mask_bbox_t = compute_fg_mask_seg_gpu(
+                        segmenter, frame_a, frame_b, args.fg_classes,
+                        grid_a_t, grid_b_t, args.fg_dilate,
+                        static["overlap_bbox"], overlap_in_bbox_t,
+                    )
+                else:
+                    fg_mask_bbox = compute_fg_mask_seg_cpu(
+                        segmenter, frame_a, frame_b, args.fg_classes,
+                        map_ax, map_ay, map_bx, map_by,
+                        fg_dilate_kernel,
+                        static["overlap_bbox"], static["overlap_in_bbox"],
+                    )
             if dev["cuda_available"]:
                 warped_a_t = warp_gpu(frame_a, grid_a_t, gpu_ctx["device"],
                                       gain_t=gain_a_t)
@@ -1327,8 +1486,8 @@ def main():
                         person_mask_bbox = person_mask_bbox_t.cpu().numpy()
                     t_after_mask = time.perf_counter()
                 else:
-                    mask_a_src = segmenter.predict_mask(frame_a)
-                    mask_b_src = segmenter.predict_mask(frame_b)
+                    mask_a_src = segmenter.predict_classes_mask(frame_a)
+                    mask_b_src = segmenter.predict_classes_mask(frame_b)
                     t_after_yolo = time.perf_counter()
                     mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
                     mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
@@ -1368,6 +1527,14 @@ def main():
                                     cost_ema, 1.0 - ema_eff,
                                     0, dst=cost_ema)
                 cost_for_dp = cost_ema.copy()
+                # Mirror the GPU penalty hierarchy: FG (lower priority) where
+                # fg_mask AND NOT person_mask, then PERSON_PENALTY on person.
+                if use_fg and fg_mask_bbox is not None:
+                    if person_mask_bbox.any():
+                        fg_only = (fg_mask_bbox > 0) & (person_mask_bbox == 0)
+                    else:
+                        fg_only = fg_mask_bbox > 0
+                    cost_for_dp[fg_only] += args.fg_penalty
                 if person_mask_bbox.any():
                     cost_for_dp[person_mask_bbox > 0] += PERSON_PENALTY
 
@@ -1407,10 +1574,14 @@ def main():
                 )
             if args.debug_mask:
                 # Layer FG (yellow, bottom) under person (red, top).
-                if use_fg and fg_mask_bbox_t is not None:
-                    fg_cpu = fg_mask_bbox_t.cpu().numpy()
-                    draw_mask_overlay(stitched, fg_cpu, static["overlap_bbox"],
-                                      color=(0, 255, 255), alpha=0.25)
+                if use_fg:
+                    fg_overlay = (fg_mask_bbox_t.cpu().numpy()
+                                  if fg_mask_bbox_t is not None
+                                  else fg_mask_bbox)
+                    if fg_overlay is not None:
+                        draw_mask_overlay(stitched, fg_overlay,
+                                          static["overlap_bbox"],
+                                          color=(0, 255, 255), alpha=0.25)
                 draw_mask_overlay(stitched, person_mask_bbox, static["overlap_bbox"])
             if args.debug_seam:
                 draw_seam_overlay(stitched, seam_x_full, static["overlap_bbox"])
