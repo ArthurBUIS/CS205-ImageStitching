@@ -52,6 +52,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -60,7 +62,6 @@ import torch.nn.functional as F
 # Configuration
 # ---------------------------------------------------------------------------
 
-ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME = True
 HOMOGRAPHY_PATH = "homography.npy"
 PERSON_CLASS_ID = 0
 PERSON_PENALTY = 1e8
@@ -303,6 +304,52 @@ def compute_canvas(shape_a, shape_b, H_b_to_a):
     return (canvas_w, canvas_h), T, H_b_to_canvas, H_a_to_canvas
 
 
+def find_autocrop_rect(H_b_to_a, shape_a, shape_b, canvas_size, T):
+    """
+    Build a rectangle from B's two right corners (warped to canvas) and A's
+    left edge. The right side of the rectangle is the more-conservative
+    (smaller-x) of B's two right corners; the rectangle spans the y-range
+    formed by both B right corners; the left side is A's left edge on canvas.
+
+    Returns (x, y, w, h) in canvas coords.
+    """
+    canvas_w, canvas_h = canvas_size
+    h_a, w_a = shape_a[:2]
+    h_b, w_b = shape_b[:2]
+    tx, ty = float(T[0, 2]), float(T[1, 2])
+
+    # B's right corners after warp to canvas (top_right = warped (w_b, 0),
+    # bottom_right = warped (w_b, h_b)).
+    b_right_src = np.float32([[w_b, 0], [w_b, h_b]]).reshape(-1, 1, 2)
+    b_right_canvas = cv2.perspectiveTransform(b_right_src, H_b_to_a).reshape(-1, 2)
+    b_right_canvas += np.array([tx, ty], dtype=np.float32)
+    top_right, bottom_right = b_right_canvas[0], b_right_canvas[1]
+
+    # Pick the one with the lower x as (x_1, y_1); the other as (x_2, y_2).
+    if top_right[0] <= bottom_right[0]:
+        (x_1, y_1), (x_2, y_2) = top_right, bottom_right
+    else:
+        (x_1, y_1), (x_2, y_2) = bottom_right, top_right
+
+    # Left edge x = A's left edge on canvas (0 in A's local coords + tx).
+    x_left = tx
+
+    final_corners = [
+        (x_1,    y_1),
+        (x_1,    y_2),
+        (x_left, y_1),
+        (x_left, y_2),
+    ]
+
+    xs = [c[0] for c in final_corners]
+    ys = [c[1] for c in final_corners]
+    x0 = max(0,        int(round(min(xs))))
+    y0 = max(0,        int(round(min(ys))))
+    x1 = min(canvas_w, int(round(max(xs))))
+    y1 = min(canvas_h, int(round(max(ys))))
+    return x0, y0, x1 - x0, y1 - y0
+
+
 def build_remap(H, canvas_size):
     W, H_canvas = canvas_size
     H_inv = np.linalg.inv(H)
@@ -448,7 +495,7 @@ def dilate_gpu(mask_u8_t, radius):
 # GPU cost + EMA
 # ---------------------------------------------------------------------------
 
-def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
+def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
                              cost_ema_t, ema_alpha, person_mask_bbox_t,
                              fg_mask_bbox_t, fg_penalty,
                              overlap_bbox):
@@ -467,7 +514,7 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, static_t,
     diff = wa_bb - wb_bb
     photo_cost = (diff * diff).sum(dim=0)
 
-    overlap_mask = static_t["overlap_in_bbox"] > 0
+    overlap_mask = overlap_in_bbox_t > 0
     photo_cost = torch.where(overlap_mask, photo_cost,
                              torch.tensor(1e9, device=photo_cost.device,
                                           dtype=photo_cost.dtype))
@@ -810,66 +857,6 @@ def composite_multiband_cpu(warped_a, warped_b, static, seam_x_full,
     return out_buf
 
 
-def composite_feathered(warped_a, warped_b, take_from_a, take_from_b,
-                        seam_x_full, overlap_bbox, overlap_in_bbox,
-                        feather_px, out_buf):
-    out_buf.fill(0)
-    cv2.copyTo(warped_a, take_from_a, out_buf)
-    cv2.copyTo(warped_b, take_from_b, out_buf)
-    if feather_px <= 0:
-        return out_buf
-    x0, y0, x1, y1 = overlap_bbox
-    H_bb = y1 - y0
-    W_bb = x1 - x0
-    fp = int(feather_px)
-    strip_w = 2 * fp + 1
-    alpha_1d = np.linspace(1.0, 0.0, strip_w, dtype=np.float32)
-    for yi in range(H_bb):
-        seam_c_bb = int(seam_x_full[yi])
-        xl_bb = max(seam_c_bb - fp, 0)
-        xr_bb = min(seam_c_bb + fp, W_bb - 1)
-        if xr_bb < xl_bb:
-            continue
-        a_start = fp - (seam_c_bb - xl_bb)
-        a_end   = fp + (xr_bb - seam_c_bb) + 1
-        if a_end - a_start != (xr_bb - xl_bb + 1):
-            continue
-        row_valid = overlap_in_bbox[yi, xl_bb:xr_bb + 1]
-        if not row_valid.any():
-            continue
-        y_c = yi + y0
-        xl_c = xl_bb + x0
-        xr_c = xr_bb + x0
-        alpha = alpha_1d[a_start:a_end].reshape(-1, 1)
-        a_pix = warped_a[y_c, xl_c:xr_c + 1].astype(np.float32)
-        b_pix = warped_b[y_c, xl_c:xr_c + 1].astype(np.float32)
-        blended = alpha * a_pix + (1.0 - alpha) * b_pix
-        valid_idx = np.where(row_valid > 0)[0]
-        if len(valid_idx) == 0:
-            continue
-        dst = out_buf[y_c, xl_c:xr_c + 1]
-        dst[valid_idx] = blended[valid_idx].astype(np.uint8)
-    return out_buf
-
-
-def seam_to_hardcut_masks(seam_x_full, static, bbox_shape,
-                          out_take_a, out_take_b):
-    H_bb, W_bb = bbox_shape
-    col_idx = np.arange(W_bb, dtype=np.int32)[None, :]
-    seam_col = seam_x_full[:, None]
-    take_a_bool = col_idx < seam_col
-    take_a = (take_a_bool.astype(np.uint8)) * 255
-    take_b = ((~take_a_bool).astype(np.uint8)) * 255
-    x0, y0, x1, y1 = static["overlap_bbox"]
-    np.copyto(out_take_a, static["only_a_u8"])
-    np.copyto(out_take_b, static["only_b_u8"])
-    overlap_bb = static["overlap_in_bbox"]
-    take_a_in = cv2.bitwise_and(take_a, overlap_bb)
-    take_b_in = cv2.bitwise_and(take_b, overlap_bb)
-    out_take_a[y0:y1, x0:x1] = cv2.bitwise_or(out_take_a[y0:y1, x0:x1], take_a_in)
-    out_take_b[y0:y1, x0:x1] = cv2.bitwise_or(out_take_b[y0:y1, x0:x1], take_b_in)
-
-
 # ---------------------------------------------------------------------------
 # YOLO
 # ---------------------------------------------------------------------------
@@ -942,32 +929,11 @@ class PersonSegmenter:
         mask = cv2.resize(merged_small, (W, H), interpolation=cv2.INTER_NEAREST)
         return mask
 
-    def predict_mask_gpu(self, frame_bgr, target_hw):
-        H_tgt, W_tgt = target_hw
-        results = self.model.predict(
-            frame_bgr, classes=[PERSON_CLASS_ID],
-            verbose=False, retina_masks=False,
-            device=self.device,
-        )
-        if not results:
-            return torch.zeros((H_tgt, W_tgt), dtype=torch.uint8,
-                               device=self.device)
-        r = results[0]
-        if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
-            return torch.zeros((H_tgt, W_tgt), dtype=torch.uint8,
-                               device=self.device)
-        mdata = r.masks.data
-        merged = (mdata > 0.5).any(dim=0).float()
-        m = merged.unsqueeze(0).unsqueeze(0)
-        m = F.interpolate(m, size=(H_tgt, W_tgt), mode="nearest")
-        mask = (m[0, 0] * 255).to(torch.uint8)
-        return mask
-
-    def predict_classes_mask_gpu(self, frame_bgr, target_hw, class_ids):
+    def predict_classes_mask_gpu(self, frame_bgr, target_hw,
+                                 class_ids=(PERSON_CLASS_ID,)):
         """
-        Like predict_mask_gpu, but for an arbitrary list of COCO class IDs.
         Returns a (H, W) uint8 tensor on GPU with the union of all detected
-        instances of any class in `class_ids`.
+        instances of any class in `class_ids`. Default = persons only.
         """
         H_tgt, W_tgt = target_hw
         results = self.model.predict(
@@ -1057,6 +1023,9 @@ def main():
     parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--debug_seam", action="store_true")
     parser.add_argument("--debug_mask", action="store_true")
+    parser.add_argument("--autocrop", action="store_true",
+                        help="Crop output to the largest axis-aligned "
+                             "rectangle inside the stitched canvas.")
     parser.add_argument("--yolo_every", type=int, default=3)
     parser.add_argument("--mask_dilate", type=int, default=15)
     parser.add_argument("--seam_downscale", type=int, default=4)
@@ -1066,8 +1035,6 @@ def main():
     parser.add_argument("--no_cost_ema", action="store_true")
     parser.add_argument("--blend_width", type=int, default=80)
     parser.add_argument("--blend_levels", type=int, default=5)
-    parser.add_argument("--no_multiband", action="store_true")
-    parser.add_argument("--feather_px", type=int, default=8)
     parser.add_argument("--seam_lambda", type=float, default=5.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
     # Static foreground (segmentation-based) flags.
@@ -1118,17 +1085,34 @@ def main():
     print(f"[info] torch num_threads = {torch.get_num_threads()}")
 
     ema_eff = 1.0 if args.no_cost_ema else float(args.cost_ema)
-    use_multiband = not args.no_multiband
     print(f"[info] yolo_every={args.yolo_every}  "
           f"mask_dilate={args.mask_dilate}  "
           f"DP_downscale={args.seam_downscale}  "
           f"gain_comp={not args.no_gain_comp}  "
           f"cost_ema={ema_eff}  "
-          f"multiband={use_multiband}  "
           f"blend_width={args.blend_width}  "
           f"blend_levels={args.blend_levels}")
     print(f"[info] seam_lambda={args.seam_lambda}  "
           f"seam_edge_margin={args.seam_edge_margin}")
+
+    # Resolve relative video paths by searching upward from this script's
+    # directory so invoking the script from a subdirectory still finds
+    # project-local `videos/...` paths.
+    def _resolve_relpath(p):
+        if os.path.isabs(p):
+            return p
+        if os.path.exists(p):
+            return p
+        cur = os.path.dirname(__file__)
+        for _ in range(6):
+            candidate = os.path.join(cur, p)
+            if os.path.exists(candidate):
+                return candidate
+            cur = os.path.dirname(cur)
+        return p
+
+    args.video_a = _resolve_relpath(args.video_a)
+    args.video_b = _resolve_relpath(args.video_b)
 
     cap_a = cv2.VideoCapture(args.video_a)
     cap_b = cv2.VideoCapture(args.video_b)
@@ -1146,19 +1130,23 @@ def main():
     if not ok:
         raise RuntimeError("Could not read first frame pair.")
 
-    if ESTIMATE_HOMOGRAPHY_FROM_FIRST_FRAME:
-        print("[info] Estimating homography from first frame pair...")
-        H_b_to_a = estimate_homography(frame_a, frame_b)
-        np.save(HOMOGRAPHY_PATH, H_b_to_a)
-    else:
-        if not Path(HOMOGRAPHY_PATH).exists():
-            raise RuntimeError(f"{HOMOGRAPHY_PATH} not found.")
-        H_b_to_a = np.load(HOMOGRAPHY_PATH)
+    print("[info] Estimating homography from first frame pair...")
+    H_b_to_a = estimate_homography(frame_a, frame_b)
+    np.save(HOMOGRAPHY_PATH, H_b_to_a)
 
     canvas_size, T, H_b_to_canvas, H_a_to_canvas = compute_canvas(
         frame_a.shape, frame_b.shape, H_b_to_a
     )
     print(f"[info] Canvas size: {canvas_size[0]} x {canvas_size[1]}")
+
+    crop_rect = None
+    if args.autocrop:
+        crop_rect = find_autocrop_rect(
+            H_b_to_a, frame_a.shape, frame_b.shape, canvas_size, T,
+        )
+        cx, cy, cw, ch = crop_rect
+        print(f"[info] Autocrop: x={cx} y={cy} size={cw}x{ch} "
+              f"(from full canvas {canvas_size[0]}x{canvas_size[1]})")
 
     print("[info] Precomputing remap maps + static geometry...")
     map_ax, map_ay = build_remap(H_a_to_canvas, canvas_size)
@@ -1205,6 +1193,10 @@ def main():
     grid_b_t = None
     overlap_in_bbox_t = None
     cost_ema_t = None
+    # Defaults for foreground (FG) variables when running on CPU
+    use_fg = False
+    fg_mask_bbox_t = None
+    fg_recompute_frames = 0
     if dev["cuda_available"]:
         torch_device = torch.device("cuda")
         valid_in_bbox_np = cv2.bitwise_or(static["mask_a_in_bbox"],
@@ -1250,8 +1242,6 @@ def main():
             
     W, H = canvas_size
     out_buf      = np.zeros((H, W, 3), dtype=np.uint8)
-    take_from_a  = np.zeros((H, W), dtype=np.uint8)
-    take_from_b  = np.zeros((H, W), dtype=np.uint8)
     cost_scratch = np.empty((bbox_shape[0], bbox_shape[1], 3), dtype=np.float32)
     person_mask_bbox = np.zeros(bbox_shape, dtype=np.uint8)
     person_mask_bbox_t = None
@@ -1263,7 +1253,8 @@ def main():
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     # *** Output FPS now comes from the FrameSyncReader ***
-    raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, canvas_size)
+    output_size = (crop_rect[2], crop_rect[3]) if crop_rect else canvas_size
+    raw_writer = cv2.VideoWriter(args.output, fourcc, sync_reader.output_fps, output_size)
     if not raw_writer.isOpened():
         raise RuntimeError(f"Could not open output writer for {args.output}")
     writer = ThreadedVideoWriter(raw_writer, queue_depth=4)
@@ -1273,11 +1264,17 @@ def main():
     frame_idx = 0
     t_start = time.time()
 
+    # Reuse the homography frame as the first iteration; subsequent iterations
+    # pull from the sync reader.
+    pending_first_pair = (frame_a, frame_b)
+
     try:
         while True:
             tt = time.perf_counter()
-            if frame_idx > 0:
-                # Use the FPS-aware reader.
+            if pending_first_pair is not None:
+                frame_a, frame_b = pending_first_pair
+                pending_first_pair = None
+            else:
                 ok, frame_a, frame_b = sync_reader.read()
                 if not ok:
                     break
@@ -1295,8 +1292,6 @@ def main():
                                       gain_t=gain_a_t)
                 warped_b_t = warp_gpu(frame_b, grid_b_t, gpu_ctx["device"],
                                       gain_t=gain_b_t)
-                warped_a = None
-                warped_b = None
             else:
                 if lut_a is not None:
                     frame_a_g = apply_gain_lut(frame_a, lut_a)
@@ -1316,10 +1311,10 @@ def main():
 
             if frame_idx % args.yolo_every == 0:
                 if dev["cuda_available"]:
-                    mask_a_src_t = segmenter.predict_mask_gpu(
+                    mask_a_src_t = segmenter.predict_classes_mask_gpu(
                         frame_a, frame_a.shape[:2],
                     )
-                    mask_b_src_t = segmenter.predict_mask_gpu(
+                    mask_b_src_t = segmenter.predict_classes_mask_gpu(
                         frame_b, frame_b.shape[:2],
                     )
                     t_after_yolo = time.perf_counter()
@@ -1347,18 +1342,16 @@ def main():
                 t_after_mask = t3
 
             if dev["cuda_available"]:
-                static_t = {"overlap_in_bbox": overlap_in_bbox_t}
                 has_person = (person_mask_bbox_t.any().item()
                               if person_mask_bbox_t is not None else False)
-                cost_ema_t, cost_for_dp_np = compute_cost_and_ema_gpu(
-                    warped_a_t, warped_b_t, static_t,
+                cost_ema_t, cost_for_dp = compute_cost_and_ema_gpu(
+                    warped_a_t, warped_b_t, overlap_in_bbox_t,
                     cost_ema_t, ema_eff,
                     person_mask_bbox_t if has_person else None,
                     fg_mask_bbox_t if use_fg else None,
                     args.fg_penalty,
                     static["overlap_bbox"],
                 )
-                cost_for_dp = cost_for_dp_np
             else:
                 wa_bb = warped_a[y0:y1, x0:x1]
                 wb_bb = warped_b[y0:y1, x0:x1]
@@ -1401,30 +1394,16 @@ def main():
             t6 = time.perf_counter()
             t_seam += t6 - t5
 
-            if use_multiband:
-                if gpu_ctx is not None:
-                    stitched = composite_multiband_gpu_resident(
-                        warped_a_t, warped_b_t, static, seam_x_full,
-                        args.blend_width, args.blend_levels, out_buf,
-                        gpu_ctx,
-                    )
-                else:
-                    stitched = composite_multiband_cpu(
-                        warped_a, warped_b, static, seam_x_full,
-                        args.blend_width, args.blend_levels, out_buf,
-                    )
-            else:
-                if warped_a is None:
-                    warped_a = warped_a_t[0].permute(1, 2, 0).cpu().numpy()
-                    warped_b = warped_b_t[0].permute(1, 2, 0).cpu().numpy()
-                seam_to_hardcut_masks(
-                    seam_x_full, static, bbox_shape,
-                    take_from_a, take_from_b,
+            if gpu_ctx is not None:
+                stitched = composite_multiband_gpu_resident(
+                    warped_a_t, warped_b_t, static, seam_x_full,
+                    args.blend_width, args.blend_levels, out_buf,
+                    gpu_ctx,
                 )
-                stitched = composite_feathered(
-                    warped_a, warped_b, take_from_a, take_from_b,
-                    seam_x_full, static["overlap_bbox"],
-                    static["overlap_in_bbox"], args.feather_px, out_buf,
+            else:
+                stitched = composite_multiband_cpu(
+                    warped_a, warped_b, static, seam_x_full,
+                    args.blend_width, args.blend_levels, out_buf,
                 )
             if args.debug_mask:
                 # Layer FG (yellow, bottom) under person (red, top).
@@ -1438,6 +1417,9 @@ def main():
             t7 = time.perf_counter()
             t_composite += t7 - t6
 
+            if crop_rect is not None:
+                cx, cy, cw, ch = crop_rect
+                stitched = stitched[cy:cy + ch, cx:cx + cw]
             writer.write(stitched)
             t8 = time.perf_counter()
             t_write += t8 - t7
