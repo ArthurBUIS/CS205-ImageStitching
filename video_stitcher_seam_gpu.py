@@ -96,9 +96,6 @@ Static foreground (segmentation-based):
                                 table, tv, laptop, book).
     --fg_dilate PX              Dilation radius for the FG mask, in
                                 pixels. Default: 10.
-    --fg_penalty F              Cost penalty added to FG pixels (and
-                                NOT-person — person wins where they
-                                overlap). Default: 5e7.
     --fg_recompute_seconds F    Seconds between FG mask recomputations.
                                 0 = compute once at startup and never
                                 again. Increase if the scene has
@@ -116,13 +113,27 @@ Cost-map behavior:
                                 previous seam" attractor. 0 disables it.
                                 Higher pins the seam harder; too high
                                 and the seam reacts sluggishly when a
-                                person approaches. Default: 5.0.
+                                person approaches. Default: 8.0.
     --seam_edge_margin N        Width in pixels of the forbidden band at
                                 the left/right edges of the overlap
                                 bbox. Should be at least blend_width / 2
                                 so the multi-band blur doesn't reach
                                 into padded pixels. 0 disables.
                                 Default: 50.
+    --edge_penalty F            Cost added to pixels inside the
+                                seam_edge_margin band. Default: 1e6.
+
+Crossing penalties (added to the cost map at seam-finding time):
+    --person_penalty F          Cost added to pixels covered by the
+                                YOLO person mask (highest priority —
+                                wins over FG when they overlap).
+                                Default: 1e8.
+    --fg_penalty F              Cost added to FG-AND-NOT-person pixels.
+                                Default: 5e7.
+
+  The intended hierarchy is fg_penalty < person_penalty so that the
+  seam will detour around static FG when it can, but is forbidden from
+  cutting through people even at the cost of crossing FG.
 
 Seam computation:
     --seam_downscale N          Factor by which the cost map is
@@ -613,7 +624,7 @@ def dilate_gpu(mask_u8_t, radius):
 
 def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
                              cost_ema_t, ema_alpha, person_mask_bbox_t,
-                             fg_mask_bbox_t, fg_penalty,
+                             fg_mask_bbox_t, fg_penalty, person_penalty,
                              overlap_bbox):
     """
     GPU cost + EMA + penalty injection.
@@ -621,7 +632,7 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
     Penalty hierarchy (additive on cost_ema):
         photometric (0 - 1e5)
         + fg_penalty (default 5e7) where fg_mask AND NOT person_mask
-        + PERSON_PENALTY (1e8) where person_mask
+        + person_penalty (default 1e8) where person_mask
     """
     x0, y0, x1, y1 = overlap_bbox
     wa_bb = warped_a_t[0, :, y0:y1, x0:x1].float()
@@ -658,7 +669,7 @@ def compute_cost_and_ema_gpu(warped_a_t, warped_b_t, overlap_in_bbox_t,
                                   cost_for_dp)
     if person_mask_bbox_t is not None:
         cost_for_dp = torch.where(person_mask_bbox_t > 0,
-                                  cost_for_dp + PERSON_PENALTY,
+                                  cost_for_dp + person_penalty,
                                   cost_for_dp)
 
     cost_for_dp_cpu = cost_for_dp.cpu().numpy()
@@ -1175,8 +1186,14 @@ def main():
     parser.add_argument("--no_cost_ema", action="store_true")
     parser.add_argument("--blend_width", type=int, default=80)
     parser.add_argument("--blend_levels", type=int, default=5)
-    parser.add_argument("--seam_lambda", type=float, default=5.0)
+    parser.add_argument("--seam_lambda", type=float, default=8.0)
     parser.add_argument("--seam_edge_margin", type=int, default=50)
+    parser.add_argument("--person_penalty", type=float, default=PERSON_PENALTY,
+                        help=f"Cost penalty for person-mask pixels "
+                             f"(default {PERSON_PENALTY:g}).")
+    parser.add_argument("--edge_penalty", type=float, default=EDGE_PENALTY,
+                        help=f"Cost penalty for the seam_edge_margin band "
+                             f"(default {EDGE_PENALTY:g}).")
     # Static foreground (segmentation-based) flags.
     parser.add_argument("--no_fg", action="store_true",
                         help="Disable static foreground detection.")
@@ -1508,7 +1525,7 @@ def main():
                     cost_ema_t, ema_eff,
                     person_mask_bbox_t if has_person else None,
                     fg_mask_bbox_t if use_fg else None,
-                    args.fg_penalty,
+                    args.fg_penalty, args.person_penalty,
                     static["overlap_bbox"],
                 )
             else:
@@ -1528,7 +1545,7 @@ def main():
                                     0, dst=cost_ema)
                 cost_for_dp = cost_ema.copy()
                 # Mirror the GPU penalty hierarchy: FG (lower priority) where
-                # fg_mask AND NOT person_mask, then PERSON_PENALTY on person.
+                # fg_mask AND NOT person_mask, then person_penalty on person.
                 if use_fg and fg_mask_bbox is not None:
                     if person_mask_bbox.any():
                         fg_only = (fg_mask_bbox > 0) & (person_mask_bbox == 0)
@@ -1536,9 +1553,10 @@ def main():
                         fg_only = fg_mask_bbox > 0
                     cost_for_dp[fg_only] += args.fg_penalty
                 if person_mask_bbox.any():
-                    cost_for_dp[person_mask_bbox > 0] += PERSON_PENALTY
+                    cost_for_dp[person_mask_bbox > 0] += args.person_penalty
 
-            add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin)
+            add_edge_margin_penalty(cost_for_dp, args.seam_edge_margin,
+                                    edge_penalty=args.edge_penalty)
 
             t5 = time.perf_counter()
             t_cost += t5 - t_after_mask
