@@ -87,6 +87,15 @@ Person segmentation (YOLOv8n-seg):
                                 the same person. Increase if the seam
                                 grazes a person's outline; decrease if
                                 the mask engulfs background. Default: 15.
+    --mask_ema A                EMA factor in [0, 1] applied to the
+                                person mask between consecutive YOLO
+                                runs. Lower = more temporal smoothing
+                                (less jitter, slower to react to genuine
+                                motion). 1.0 disables smoothing.
+                                Default: 0.3.
+    --mask_ema_threshold T      Threshold applied to the smoothed (EMA)
+                                person mask to obtain the binary mask
+                                used by the cost map. Default: 0.6.
 
 Static foreground (segmentation-based):
     --no_fg                     Disable static FG detection entirely.
@@ -1179,6 +1188,15 @@ def main():
                              "rectangle inside the stitched canvas.")
     parser.add_argument("--yolo_every", type=int, default=3)
     parser.add_argument("--mask_dilate", type=int, default=15)
+    parser.add_argument("--mask_ema", type=float, default=0.3,
+                        help="EMA factor in [0, 1] for the person mask. "
+                             "Lower = more temporal smoothing (less "
+                             "jitter, slower to react). 1.0 disables. "
+                             "Default: 0.3.")
+    parser.add_argument("--mask_ema_threshold", type=float, default=0.4,
+                        help="Threshold applied to the smoothed person "
+                             "mask to obtain the binary mask used for "
+                             "the cost map. Default: 0.4.")
     parser.add_argument("--seam_downscale", type=int, default=4)
     parser.add_argument("--yolo_weights", default="yolov8n-seg.pt")
     parser.add_argument("--no_gain_comp", action="store_true")
@@ -1416,6 +1434,10 @@ def main():
     if dev["cuda_available"]:
         person_mask_bbox_t = torch.zeros(bbox_shape, dtype=torch.uint8,
                                          device=gpu_ctx["device"])
+    # Float EMA buffers for person mask temporal smoothing. Filled on the
+    # first YOLO run; None means "no history yet".
+    person_mask_ema_t = None  # GPU path
+    person_mask_ema = None    # CPU path
     cost_ema = None
     seam_prev_small = None
 
@@ -1498,7 +1520,19 @@ def main():
                     mask_b_canvas_t = warp_mask_gpu(mask_b_src_t, grid_b_t)
                     union_t = torch.bitwise_or(mask_a_canvas_t, mask_b_canvas_t)
                     union_t = dilate_gpu(union_t, args.mask_dilate)
-                    person_mask_bbox_t = union_t[y0:y1, x0:x1].contiguous()
+                    raw_mask_t = union_t[y0:y1, x0:x1].contiguous()
+                    # Temporal EMA on the float mask, then re-binarize.
+                    new_float = (raw_mask_t > 0).float()
+                    if person_mask_ema_t is None:
+                        person_mask_ema_t = new_float
+                    else:
+                        a = args.mask_ema
+                        person_mask_ema_t = (a * new_float
+                                             + (1.0 - a) * person_mask_ema_t)
+                    person_mask_bbox_t = (
+                        (person_mask_ema_t > args.mask_ema_threshold)
+                        .to(torch.uint8) * 255
+                    ).contiguous()
                     if args.debug_mask:
                         person_mask_bbox = person_mask_bbox_t.cpu().numpy()
                     t_after_mask = time.perf_counter()
@@ -1510,7 +1544,19 @@ def main():
                     mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
                     union = cv2.bitwise_or(mask_a_canvas, mask_b_canvas)
                     union = cv2.dilate(union, dilate_kernel)
-                    person_mask_bbox = union[y0:y1, x0:x1].copy()
+                    raw_mask = union[y0:y1, x0:x1]
+                    # Temporal EMA on the float mask, then re-binarize.
+                    new_float = (raw_mask > 0).astype(np.float32)
+                    if person_mask_ema is None:
+                        person_mask_ema = new_float
+                    else:
+                        a = args.mask_ema
+                        person_mask_ema = (a * new_float
+                                           + (1.0 - a) * person_mask_ema)
+                    person_mask_bbox = (
+                        (person_mask_ema > args.mask_ema_threshold)
+                        .astype(np.uint8) * 255
+                    )
                     t_after_mask = time.perf_counter()
                 t_yolo += t_after_yolo - t3
                 t_maskwarp += t_after_mask - t_after_yolo
