@@ -73,14 +73,37 @@ General:
                                 space and removes the polygonal black
                                 borders of the raw stitched canvas.
 
-Person segmentation (YOLOv8n-seg):
-    --yolo_weights PATH         Path/name of YOLO weights file. Default:
-                                yolov8n-seg.pt (auto-downloaded on first
-                                run, ~7 MB).
-    --yolo_every N              Run YOLO once every N frames; reuse the
-                                cached mask in between. Lower = fresher
-                                mask but slower. Higher = staler but
-                                faster. Default: 3.
+Segmentation models (one per task; share a model when both tasks pick the
+same type):
+    --person_model {yolov8,yoloe}
+                                Model used for person detection. yoloe
+                                is more accurate (esp. on edge cases like
+                                partial occlusions) but ~2-3x slower than
+                                yolov8. Default: yoloe.
+    --fg_model {yolov8,yoloe}   Model used for static FG detection.
+                                yoloe lets you target arbitrary object
+                                types via text prompts; yolov8 is
+                                limited to the 80 COCO classes. Default:
+                                yoloe.
+    --yolo_weights PATH         YOLOv8 weights file. Used when either
+                                --person_model or --fg_model is yolov8.
+                                Default: yolov8n-seg.pt.
+    --yoloe_weights PATH        YOLOE weights file. Used when either
+                                --person_model or --fg_model is yoloe.
+                                Default: yoloe-11s-seg.pt.
+    --yoloe_person_class STR    Text prompt for the person class when
+                                --person_model is yoloe. Default:
+                                "person".
+    --yoloe_fg_classes STR ...  Text prompts for static FG classes when
+                                --fg_model is yoloe. Multi-word prompts
+                                must be quoted ("dining table"). Default:
+                                chair couch bed "dining table" tv laptop
+                                book "potted plant" backpack.
+
+Person mask:
+    --yolo_every N              Run the person model once every N frames;
+                                reuse the cached mask in between. Lower =
+                                fresher mask but slower. Default: 3.
     --mask_dilate PX            Dilation radius applied to the unioned
                                 person mask, in pixels. Absorbs the
                                 parallax offset between A and B's view of
@@ -88,21 +111,28 @@ Person segmentation (YOLOv8n-seg):
                                 grazes a person's outline; decrease if
                                 the mask engulfs background. Default: 15.
     --mask_ema A                EMA factor in [0, 1] applied to the
-                                person mask between consecutive YOLO
-                                runs. Lower = more temporal smoothing
-                                (less jitter, slower to react to genuine
+                                person mask between consecutive runs.
+                                Lower = more temporal smoothing (less
+                                jitter, slower to react to genuine
                                 motion). 1.0 disables smoothing.
-                                Default: 0.3.
+                                Default: 1.0.
+                                Mainly useful with --person_model yolov8,
+                                which is jitterier than yoloe; yoloe's
+                                masks are usually stable enough that
+                                smoothing isn't needed.
     --mask_ema_threshold T      Threshold applied to the smoothed (EMA)
                                 person mask to obtain the binary mask
-                                used by the cost map. Default: 0.6.
+                                used by the cost map. Ignored when
+                                --mask_ema is 1.0. Default: 0.6.
 
 Static foreground (segmentation-based):
     --no_fg                     Disable static FG detection entirely.
     --fg_classes CLASS_IDS ...  Space-separated COCO class IDs to treat
-                                as static foreground. Default: 56 57 59
+                                as static foreground. Used only when
+                                --fg_model is yolov8. Default: 56 57 59
                                 60 62 63 73 (chair, couch, bed, dining
-                                table, tv, laptop, book).
+                                table, tv, laptop, book). For yoloe, see
+                                --yoloe_fg_classes.
     --fg_dilate PX              Dilation radius for the FG mask, in
                                 pixels. Default: 10.
     --fg_recompute_seconds F    Seconds between FG mask recomputations.
@@ -173,6 +203,13 @@ Usage
 -----
     python video_stitcher_seam_gpu.py \\
         --video_a camA.mp4 --video_b camB.mp4 --output stitched.mp4
+
+The default uses YOLOE for both person and FG detection (highest
+accuracy, ~2-3x slower than YOLOv8). For maximum speed, switch both
+back to YOLOv8 and enable temporal smoothing:
+
+    python video_stitcher_seam_gpu.py ... \\
+        --person_model yolov8 --fg_model yolov8 --mask_ema 0.3
 
 For a first run on a new scene, add --debug_seam --debug_mask --autocrop
 and reduce --max_frames to inspect the seam, the masks, and the crop
@@ -1055,12 +1092,33 @@ def compute_fg_mask_seg_cpu(segmenter, frame_a, frame_b, class_ids,
 
 
 class PersonSegmenter:
-    def __init__(self, weights_path: str, device: str = "cpu"):
+    def __init__(self, weights_path: str, device: str = "cpu",
+                 use_yoloe: bool = False, text_classes=None):
+        """
+        weights_path : YOLOv8-seg or YOLOE-seg weights file.
+        use_yoloe    : if True, load via ultralytics.YOLOE and call
+                       set_classes(text_classes, get_text_pe(text_classes))
+                       so the model returns masks for the text-prompted
+                       classes only. Otherwise, load via ultralytics.YOLO.
+        text_classes : list of strings; required when use_yoloe is True.
+                       After set_classes, classes are 0..N-1 in the order
+                       of this list.
+        """
         try:
-            from ultralytics import YOLO
+            if use_yoloe:
+                from ultralytics import YOLOE
+                if not text_classes:
+                    raise RuntimeError("YOLOE requires a non-empty text_classes list.")
+                self.model = YOLOE(weights_path)
+                self.model.set_classes(
+                    list(text_classes),
+                    self.model.get_text_pe(list(text_classes)),
+                )
+            else:
+                from ultralytics import YOLO
+                self.model = YOLO(weights_path)
         except ImportError as e:
             raise RuntimeError("pip install ultralytics") from e
-        self.model = YOLO(weights_path)
         self.device = device
         try:
             self.model.to(device)
@@ -1188,17 +1246,44 @@ def main():
                              "rectangle inside the stitched canvas.")
     parser.add_argument("--yolo_every", type=int, default=3)
     parser.add_argument("--mask_dilate", type=int, default=15)
-    parser.add_argument("--mask_ema", type=float, default=0.3,
+    parser.add_argument("--mask_ema", type=float, default=1.0,
                         help="EMA factor in [0, 1] for the person mask. "
                              "Lower = more temporal smoothing (less "
                              "jitter, slower to react). 1.0 disables. "
-                             "Default: 0.3.")
-    parser.add_argument("--mask_ema_threshold", type=float, default=0.4,
+                             "Mainly useful with --person_model yolov8, "
+                             "which is jitterier than yoloe. Default: 1.0.")
+    parser.add_argument("--mask_ema_threshold", type=float, default=0.6,
                         help="Threshold applied to the smoothed person "
                              "mask to obtain the binary mask used for "
-                             "the cost map. Default: 0.4.")
+                             "the cost map. Ignored when --mask_ema is "
+                             "1.0. Default: 0.6.")
     parser.add_argument("--seam_downscale", type=int, default=4)
-    parser.add_argument("--yolo_weights", default="yolov8n-seg.pt")
+    # Segmentation model selection ----------------------------------------
+    parser.add_argument("--person_model", choices=["yolov8", "yoloe"],
+                        default="yoloe",
+                        help="Which model to use for person detection. "
+                             "yoloe is more accurate but slower. "
+                             "Default: yoloe.")
+    parser.add_argument("--fg_model", choices=["yolov8", "yoloe"],
+                        default="yoloe",
+                        help="Which model to use for static foreground "
+                             "detection. yoloe lets you target arbitrary "
+                             "object types via text prompts. Default: yoloe.")
+    parser.add_argument("--yolo_weights", default="yolov8n-seg.pt",
+                        help="YOLOv8 weights file. Default: yolov8n-seg.pt.")
+    parser.add_argument("--yoloe_weights", default="yoloe-11s-seg.pt",
+                        help="YOLOE weights file. Default: yoloe-11s-seg.pt.")
+    parser.add_argument("--yoloe_person_class", default="person",
+                        help="Text prompt for the person class when "
+                             "--person_model is yoloe. Default: 'person'.")
+    parser.add_argument("--yoloe_fg_classes", type=str, nargs="+",
+                        default=["chair", "couch", "bed", "dining table",
+                                 "tv", "laptop", "book", "potted plant",
+                                 "backpack"],
+                        help="Text prompts for static FG classes when "
+                             "--fg_model is yoloe. Default: chair couch "
+                             "bed 'dining table' tv laptop book "
+                             "'potted plant' backpack.")
     parser.add_argument("--no_gain_comp", action="store_true")
     parser.add_argument("--cost_ema", type=float, default=0.4)
     parser.add_argument("--no_cost_ema", action="store_true")
@@ -1356,8 +1441,52 @@ def main():
             lut_a = build_gain_lut(gains_a)
             lut_b = build_gain_lut(gains_b)
 
-    print(f"[info] Loading YOLO weights: {args.yolo_weights}")
-    segmenter = PersonSegmenter(args.yolo_weights, device=dev["yolo_device"])
+    # ---- Segmentation model selection ------------------------------------
+    # Build one segmenter per task. When both tasks use the same model
+    # type, share a single underlying model (one YOLOE set_classes call
+    # with the combined [person, *fg] list, or one YOLOv8 instance).
+    person_yoloe = args.person_model == "yoloe"
+    fg_yoloe = args.fg_model == "yoloe"
+
+    def _mk_yolov8():
+        return PersonSegmenter(args.yolo_weights, device=dev["yolo_device"])
+
+    def _mk_yoloe(text_classes):
+        return PersonSegmenter(
+            args.yoloe_weights, device=dev["yolo_device"],
+            use_yoloe=True, text_classes=text_classes,
+        )
+
+    if person_yoloe and fg_yoloe:
+        text_classes = [args.yoloe_person_class] + list(args.yoloe_fg_classes)
+        print(f"[info] Loading YOLOE for person + FG: {args.yoloe_weights}")
+        print(f"[info] YOLOE classes (index 0 = person, 1+ = FG): {text_classes}")
+        person_segmenter = _mk_yoloe(text_classes)
+        fg_segmenter = person_segmenter
+        person_class_ids = [0]
+        fg_class_ids = list(range(1, len(text_classes)))
+    elif not person_yoloe and not fg_yoloe:
+        print(f"[info] Loading YOLOv8 for person + FG: {args.yolo_weights}")
+        person_segmenter = _mk_yolov8()
+        fg_segmenter = person_segmenter
+        person_class_ids = [PERSON_CLASS_ID]
+        fg_class_ids = list(args.fg_classes)
+    elif person_yoloe and not fg_yoloe:
+        print(f"[info] Loading YOLOE for person: {args.yoloe_weights} "
+              f"(class: {args.yoloe_person_class!r})")
+        person_segmenter = _mk_yoloe([args.yoloe_person_class])
+        person_class_ids = [0]
+        print(f"[info] Loading YOLOv8 for FG: {args.yolo_weights}")
+        fg_segmenter = _mk_yolov8()
+        fg_class_ids = list(args.fg_classes)
+    else:  # not person_yoloe and fg_yoloe
+        print(f"[info] Loading YOLOv8 for person: {args.yolo_weights}")
+        person_segmenter = _mk_yolov8()
+        person_class_ids = [PERSON_CLASS_ID]
+        print(f"[info] Loading YOLOE for FG: {args.yoloe_weights} "
+              f"(classes: {list(args.yoloe_fg_classes)})")
+        fg_segmenter = _mk_yoloe(list(args.yoloe_fg_classes))
+        fg_class_ids = list(range(len(args.yoloe_fg_classes)))
     dilate_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (2 * args.mask_dilate + 1, 2 * args.mask_dilate + 1),
@@ -1398,18 +1527,18 @@ def main():
     fg_mask_bbox = None    # CPU path
     if use_fg:
         print(f"[info] Computing static FG mask via YOLO segmentation. "
-              f"Classes: {args.fg_classes}")
+              f"Class IDs: {fg_class_ids}")
         t0 = time.time()
         if dev["cuda_available"]:
             fg_mask_bbox_t = compute_fg_mask_seg_gpu(
-                segmenter, frame_a, frame_b, args.fg_classes,
+                fg_segmenter, frame_a, frame_b, fg_class_ids,
                 grid_a_t, grid_b_t, args.fg_dilate,
                 static["overlap_bbox"], overlap_in_bbox_t,
             )
             coverage = (fg_mask_bbox_t > 0).float().mean().item() * 100
         else:
             fg_mask_bbox = compute_fg_mask_seg_cpu(
-                segmenter, frame_a, frame_b, args.fg_classes,
+                fg_segmenter, frame_a, frame_b, fg_class_ids,
                 map_ax, map_ay, map_bx, map_by,
                 fg_dilate_kernel,
                 static["overlap_bbox"], static["overlap_in_bbox"],
@@ -1474,13 +1603,13 @@ def main():
                     and frame_idx % fg_recompute_frames == 0):
                 if dev["cuda_available"]:
                     fg_mask_bbox_t = compute_fg_mask_seg_gpu(
-                        segmenter, frame_a, frame_b, args.fg_classes,
+                        fg_segmenter, frame_a, frame_b, fg_class_ids,
                         grid_a_t, grid_b_t, args.fg_dilate,
                         static["overlap_bbox"], overlap_in_bbox_t,
                     )
                 else:
                     fg_mask_bbox = compute_fg_mask_seg_cpu(
-                        segmenter, frame_a, frame_b, args.fg_classes,
+                        fg_segmenter, frame_a, frame_b, fg_class_ids,
                         map_ax, map_ay, map_bx, map_by,
                         fg_dilate_kernel,
                         static["overlap_bbox"], static["overlap_in_bbox"],
@@ -1509,11 +1638,11 @@ def main():
 
             if frame_idx % args.yolo_every == 0:
                 if dev["cuda_available"]:
-                    mask_a_src_t = segmenter.predict_classes_mask_gpu(
-                        frame_a, frame_a.shape[:2],
+                    mask_a_src_t = person_segmenter.predict_classes_mask_gpu(
+                        frame_a, frame_a.shape[:2], person_class_ids,
                     )
-                    mask_b_src_t = segmenter.predict_classes_mask_gpu(
-                        frame_b, frame_b.shape[:2],
+                    mask_b_src_t = person_segmenter.predict_classes_mask_gpu(
+                        frame_b, frame_b.shape[:2], person_class_ids,
                     )
                     t_after_yolo = time.perf_counter()
                     mask_a_canvas_t = warp_mask_gpu(mask_a_src_t, grid_a_t)
@@ -1537,8 +1666,12 @@ def main():
                         person_mask_bbox = person_mask_bbox_t.cpu().numpy()
                     t_after_mask = time.perf_counter()
                 else:
-                    mask_a_src = segmenter.predict_classes_mask(frame_a)
-                    mask_b_src = segmenter.predict_classes_mask(frame_b)
+                    mask_a_src = person_segmenter.predict_classes_mask(
+                        frame_a, person_class_ids,
+                    )
+                    mask_b_src = person_segmenter.predict_classes_mask(
+                        frame_b, person_class_ids,
+                    )
                     t_after_yolo = time.perf_counter()
                     mask_a_canvas = cv2.remap(mask_a_src, map_ax, map_ay, cv2.INTER_NEAREST)
                     mask_b_canvas = cv2.remap(mask_b_src, map_bx, map_by, cv2.INTER_NEAREST)
